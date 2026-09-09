@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.config import settings
 from app.db.base import Base
+import app.db.models  # noqa: F401  (populates Base.metadata for autogenerate)
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
