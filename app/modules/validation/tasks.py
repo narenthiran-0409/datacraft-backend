@@ -301,6 +301,19 @@ def run_validation(job_id: str, validation_run_id: str) -> dict:
         failures_persisted_count = 0
 
         for row_idx in range(total_rows):
+            # BUG FIX (found via live E2E cancel testing): cancellation was only ever
+            # checked before evaluation started (above), never during this loop — which
+            # is where the time actually goes for any dataset large enough to matter
+            # (one db.flush() per row). A cancel request arriving after the pre-evaluation
+            # checkpoint was silently ignored: the API returned 200 and the redis flag was
+            # genuinely set, but the run completed anyway. Checked periodically (not every
+            # row) to avoid a redis round-trip per row on large datasets.
+            if row_idx % 500 == 0 and jobs_service.is_cancel_requested(job.id):
+                db.rollback()
+                _cancel(jobs_service, audit, job, validation_run, dataset, actor)
+                db.commit()
+                return {"status": "CANCELLED"}
+
             row_failure_entries = failures_by_row.get(row_idx, [])
             failure_count = len(row_failure_entries)
 
