@@ -27,6 +27,7 @@ PERMISSION_ROUTES = [
     ("POST", f"/api/v1/datasets/{RANDOM_ID}/validate", {}),
     ("GET", "/api/v1/validation-runs", None),
     ("GET", f"/api/v1/validation-runs/{RANDOM_ID}", None),
+    ("GET", f"/api/v1/validation-runs/{RANDOM_ID}/failures", None),
     ("GET", f"/api/v1/datasets/{RANDOM_ID}/validation", None),
 ]
 

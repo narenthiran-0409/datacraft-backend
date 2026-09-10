@@ -30,3 +30,29 @@ class ValidationRunResponse(BaseModel):
     updated_at: datetime | None
 
     model_config = {"from_attributes": True}
+
+
+class ValidationFailureResponse(BaseModel):
+    id: uuid.UUID
+    validation_run_id: uuid.UUID
+    record_ref: str
+    row_index: int
+    rule_assignment_id: uuid.UUID
+    rule_id: uuid.UUID
+    rule_name: str
+    rule_type: str
+    assignment_scope: str
+    column_id: uuid.UUID | None
+    column_name: str | None
+    severity: str
+    failed_value: str | None
+    expected_value: str | None
+    reason: str | None
+    created_at: datetime
+
+
+class ValidationFailureListResponse(BaseModel):
+    items: list[ValidationFailureResponse]
+    total: int
+    page: int
+    page_size: int

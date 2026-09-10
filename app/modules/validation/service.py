@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import (
@@ -10,7 +10,18 @@ from app.core.exceptions import (
     ValidationAlreadyRunningError,
     ValidationRunNotFoundError,
 )
-from app.db.models import Dataset, Job, RuleAssignment, User, ValidationRun
+from app.db.models import (
+    Column,
+    Dataset,
+    Job,
+    Rule,
+    RuleAssignment,
+    RuleVersion,
+    User,
+    ValidationFailure,
+    ValidationResult,
+    ValidationRun,
+)
 from app.modules.lineage.service import LineageService
 
 
@@ -41,6 +52,85 @@ class ValidationService:
             .order_by(ValidationRun.created_at.desc())
             .limit(1)
         ).scalar_one_or_none()
+
+    def list_failures(
+        self,
+        *,
+        validation_run_id: uuid.UUID,
+        severity: str | None,
+        column_id: uuid.UUID | None,
+        rule_assignment_id: uuid.UUID | None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[dict], int]:
+        """Row-level failure detail for a run, joined server-side against
+        validation_results (record_ref/row_index), rule_assignments ->
+        rule_versions -> rules (rule name/type), and columns (column name)
+        — the frontend gets names, not bare IDs to resolve itself.
+
+        Filters only exist for columns validation_failures actually has
+        (severity, column_id, rule_assignment_id). There is no `status`
+        filter: status is a validation_results-level concept (PASSED/
+        WARNING/FAILED per row), not a validation_failures column — every
+        failure row is implicitly tied to a non-PASSED result already.
+        """
+        self.get_validation_run(validation_run_id)  # 404 if the run itself doesn't exist
+
+        conditions = [ValidationFailure.validation_run_id == validation_run_id]
+        if severity is not None:
+            conditions.append(ValidationFailure.severity == severity)
+        if column_id is not None:
+            conditions.append(ValidationFailure.column_id == column_id)
+        if rule_assignment_id is not None:
+            conditions.append(ValidationFailure.rule_assignment_id == rule_assignment_id)
+
+        count_stmt = select(func.count()).select_from(ValidationFailure).where(*conditions)
+        total = self._db.execute(count_stmt).scalar_one()
+
+        stmt = (
+            select(
+                ValidationFailure,
+                ValidationResult.record_ref,
+                ValidationResult.row_index,
+                Rule.id,
+                Rule.name,
+                Rule.rule_type,
+                RuleAssignment.assignment_scope,
+                Column.name,
+            )
+            .join(ValidationResult, ValidationResult.id == ValidationFailure.validation_result_id)
+            .join(RuleAssignment, RuleAssignment.id == ValidationFailure.rule_assignment_id)
+            .join(RuleVersion, RuleVersion.id == RuleAssignment.rule_version_id)
+            .join(Rule, Rule.id == RuleVersion.rule_id)
+            .outerjoin(Column, Column.id == ValidationFailure.column_id)
+            .where(*conditions)
+            .order_by(ValidationFailure.created_at)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        rows = self._db.execute(stmt).all()
+        items = [
+            {
+                "id": failure.id,
+                "validation_run_id": failure.validation_run_id,
+                "record_ref": record_ref,
+                "row_index": row_index,
+                "rule_assignment_id": failure.rule_assignment_id,
+                "rule_id": rule_id,
+                "rule_name": rule_name,
+                "rule_type": rule_type,
+                "assignment_scope": assignment_scope,
+                "column_id": failure.column_id,
+                "column_name": column_name,
+                "severity": failure.severity,
+                "failed_value": failure.failed_value,
+                "expected_value": failure.expected_value,
+                "reason": failure.reason,
+                "created_at": failure.created_at,
+            }
+            for failure, record_ref, row_index, rule_id, rule_name, rule_type, assignment_scope, column_name in rows
+        ]
+        return items, total
 
     def _get_active_dataset(self, dataset_id: uuid.UUID) -> Dataset:
         dataset = self._db.get(Dataset, dataset_id)
