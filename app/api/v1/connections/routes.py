@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.api.v1.connections.schemas import (
@@ -46,10 +46,11 @@ def list_connection_types(
 
 @router.get("/connections", response_model=list[ConnectionResponse])
 def list_connections(
+    is_active: bool | None = Query(default=None),
     service: ConnectionsService = Depends(get_connections_service),
     _: User = Depends(require_permission("connections.read")),
 ) -> list[ConnectionResponse]:
-    return [ConnectionResponse.model_validate(c) for c in service.list_connections()]
+    return [ConnectionResponse.model_validate(c) for c in service.list_connections(is_active=is_active)]
 
 
 @router.post("/connections", response_model=ConnectionResponse, status_code=201)

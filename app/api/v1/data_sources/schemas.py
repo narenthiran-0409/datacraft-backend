@@ -24,6 +24,7 @@ class DataSourceResponse(BaseModel):
     owner_team: str | None
     business_domain: str | None
     is_active: bool
+    deactivated_at: datetime | None
     created_at: datetime
     updated_at: datetime | None
 

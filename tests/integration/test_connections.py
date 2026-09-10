@@ -1,10 +1,12 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.exceptions import ConnectionNameAlreadyExistsError, DataSourceNotActiveError
-from app.db.models import AuditEvent, ConnectionType
+from app.db.models import AuditEvent, Connection, ConnectionType
 from app.modules.connections.credential_vault import LocalRedisVaultClient
 from app.modules.connections.service import ConnectionsService
 from app.modules.data_sources.service import DataSourcesService
@@ -149,3 +151,68 @@ def test_reactivate_connection_rejected_when_data_source_inactive(db: Session, r
 
     with pytest.raises(DataSourceNotActiveError):
         service.reactivate_connection(actor=admin_user, connection_id=connection.id)
+
+
+def test_deactivate_connection_sets_deactivated_at(db: Session, redis_client, admin_user) -> None:
+    ds = DataSourcesService(db).create_data_source(actor=admin_user, name="DS8", description=None, owner_team=None, business_domain=None)
+    service = _connections_service(db, redis_client)
+    connection = service.create_connection(
+        actor=admin_user, data_source_id=ds.id, connection_type_id=_pg_type(db).id, name="conn8",
+        environment="DEV", host="localhost", port=5432, database_name="db1", service_name=None,
+        username="svc", credential={"username": "svc", "password": "pw"}, config={},
+    )
+    assert connection.deactivated_at is None
+
+    deactivated = service.deactivate_connection(actor=admin_user, connection_id=connection.id)
+    assert deactivated.deactivated_at is not None
+
+
+def test_reactivate_connection_clears_deactivated_at(db: Session, redis_client, admin_user) -> None:
+    ds = DataSourcesService(db).create_data_source(actor=admin_user, name="DS9", description=None, owner_team=None, business_domain=None)
+    service = _connections_service(db, redis_client)
+    connection = service.create_connection(
+        actor=admin_user, data_source_id=ds.id, connection_type_id=_pg_type(db).id, name="conn9",
+        environment="DEV", host="localhost", port=5432, database_name="db1", service_name=None,
+        username="svc", credential={"username": "svc", "password": "pw"}, config={},
+    )
+    service.deactivate_connection(actor=admin_user, connection_id=connection.id)
+
+    reactivated = service.reactivate_connection(actor=admin_user, connection_id=connection.id)
+    assert reactivated.deactivated_at is None
+
+
+def _backdate_deactivation(db: Session, connection: Connection, days_ago: int) -> None:
+    connection.deactivated_at = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    db.commit()
+
+
+def test_list_connections_excludes_inactive_older_than_visibility_window(db: Session, redis_client, admin_user) -> None:
+    ds = DataSourcesService(db).create_data_source(actor=admin_user, name="DS10", description=None, owner_team=None, business_domain=None)
+    service = _connections_service(db, redis_client)
+    stale = service.create_connection(
+        actor=admin_user, data_source_id=ds.id, connection_type_id=_pg_type(db).id, name="stale-conn",
+        environment="DEV", host="localhost", port=5432, database_name="db1", service_name=None,
+        username="svc", credential={"username": "svc", "password": "pw"}, config={},
+    )
+    service.deactivate_connection(actor=admin_user, connection_id=stale.id)
+    _backdate_deactivation(db, stale, settings.INACTIVE_RECORD_VISIBILITY_DAYS + 1)
+
+    assert stale.id not in {c.id for c in service.list_connections(is_active=False)}
+    assert stale.id not in {c.id for c in service.list_connections()}
+    # Still in the database, untouched — a query filter only, not a delete.
+    assert db.get(Connection, stale.id) is not None
+
+
+def test_list_connections_includes_inactive_within_visibility_window(db: Session, redis_client, admin_user) -> None:
+    ds = DataSourcesService(db).create_data_source(actor=admin_user, name="DS11", description=None, owner_team=None, business_domain=None)
+    service = _connections_service(db, redis_client)
+    recent = service.create_connection(
+        actor=admin_user, data_source_id=ds.id, connection_type_id=_pg_type(db).id, name="recent-conn",
+        environment="DEV", host="localhost", port=5432, database_name="db1", service_name=None,
+        username="svc", credential={"username": "svc", "password": "pw"}, config={},
+    )
+    service.deactivate_connection(actor=admin_user, connection_id=recent.id)
+    _backdate_deactivation(db, recent, settings.INACTIVE_RECORD_VISIBILITY_DAYS - 1)
+
+    assert recent.id in {c.id for c in service.list_connections(is_active=False)}
+    assert recent.id in {c.id for c in service.list_connections()}

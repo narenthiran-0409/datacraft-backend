@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, Integer, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -29,6 +29,12 @@ class DataSource(UUIDPKMixin, TimestampMixin, Base):
     owner_team: Mapped[str | None] = mapped_column(Text, nullable=True)
     business_domain: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    # Set on deactivation, cleared (NULL) on reactivation. Distinct from
+    # updated_at, which other fields (description, owner_team, ...) also
+    # bump — deactivated_at is the one reliable "when was this actually
+    # deactivated" signal, used to age out stale-inactive rows from list
+    # views (see settings.INACTIVE_RECORD_VISIBILITY_DAYS).
+    deactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
@@ -57,6 +63,8 @@ class Connection(UUIDPKMixin, TimestampMixin, Base):
     last_tested_at: Mapped[datetime | None] = mapped_column(nullable=True)
     last_test_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    # Same semantics as DataSource.deactivated_at above.
+    deactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )

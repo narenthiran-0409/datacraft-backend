@@ -41,6 +41,13 @@ class Settings(BaseSettings):
 
     VAULT_LOCAL_ENCRYPTION_KEY: str = "auxfxLith1IRMEbLccKJOaae4X4dQf7IITmLV3NpVS0="
 
+    # A data source/connection deactivated for longer than this is excluded
+    # from list responses entirely, even when inactive records are
+    # explicitly requested — still soft-deactivated in the database, never
+    # deleted, just no longer surfaced by the list endpoints. See
+    # DataSourcesService.list_data_sources / ConnectionsService.list_connections.
+    INACTIVE_RECORD_VISIBILITY_DAYS: int = 30
+
     DISCOVERY_QUERY_TIMEOUT_SECONDS: int = 30
     STALE_JOB_THRESHOLD_MINUTES: int = 60
 

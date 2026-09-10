@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.api.v1.data_sources.schemas import DataSourceCreateRequest, DataSourceResponse, DataSourceUpdateRequest
@@ -18,10 +18,11 @@ def get_data_sources_service(db: Session = Depends(get_db)) -> DataSourcesServic
 
 @router.get("", response_model=list[DataSourceResponse])
 def list_data_sources(
+    is_active: bool | None = Query(default=None),
     service: DataSourcesService = Depends(get_data_sources_service),
     _: User = Depends(require_permission("data_sources.read")),
 ) -> list[DataSourceResponse]:
-    return [DataSourceResponse.model_validate(d) for d in service.list_data_sources()]
+    return [DataSourceResponse.model_validate(d) for d in service.list_data_sources(is_active=is_active)]
 
 
 @router.post("", response_model=DataSourceResponse, status_code=201)

@@ -1,9 +1,10 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.exceptions import (
     DataSourceHasActiveConnectionsError,
     DataSourceNameAlreadyExistsError,
@@ -18,8 +19,21 @@ class DataSourcesService:
         self._db = db
         self._audit = AuditingService(db)
 
-    def list_data_sources(self) -> list[DataSource]:
-        return list(self._db.execute(select(DataSource).order_by(DataSource.name)).scalars())
+    def list_data_sources(self, *, is_active: bool | None = None) -> list[DataSource]:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=settings.INACTIVE_RECORD_VISIBILITY_DAYS)
+        # Rows inactive longer than the cutoff (or inactive with an unknown
+        # deactivation time — deactivated_at IS NULL) are excluded no matter
+        # what is_active is asked for, per the "hidden from view, even in
+        # Show inactive views" requirement — the row stays in the database,
+        # it just never appears in a list response again.
+        stmt = (
+            select(DataSource)
+            .where(or_(DataSource.is_active.is_(True), DataSource.deactivated_at >= cutoff))
+            .order_by(DataSource.name)
+        )
+        if is_active is not None:
+            stmt = stmt.where(DataSource.is_active.is_(is_active))
+        return list(self._db.execute(stmt).scalars())
 
     def get_data_source(self, data_source_id: uuid.UUID) -> DataSource:
         data_source = self._db.get(DataSource, data_source_id)
@@ -115,8 +129,10 @@ class DataSourcesService:
                 "deactivate them first"
             )
 
+        deactivated_at = datetime.now(timezone.utc)
         data_source.is_active = False
-        data_source.updated_at = datetime.now(timezone.utc)
+        data_source.deactivated_at = deactivated_at
+        data_source.updated_at = deactivated_at
 
         self._audit.record(
             actor=actor,
@@ -131,6 +147,7 @@ class DataSourcesService:
     def reactivate_data_source(self, *, actor: User, data_source_id: uuid.UUID) -> DataSource:
         data_source = self.get_data_source(data_source_id)
         data_source.is_active = True
+        data_source.deactivated_at = None
         data_source.updated_at = datetime.now(timezone.utc)
 
         self._audit.record(

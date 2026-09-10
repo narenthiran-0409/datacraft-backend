@@ -51,6 +51,7 @@ class ConnectionResponse(BaseModel):
     last_tested_at: datetime | None
     last_test_latency_ms: int | None
     is_active: bool
+    deactivated_at: datetime | None
     created_at: datetime
     updated_at: datetime | None
 

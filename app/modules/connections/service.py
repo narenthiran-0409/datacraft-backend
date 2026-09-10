@@ -1,9 +1,10 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.exceptions import (
     ConnectionNameAlreadyExistsError,
     ConnectionNotFoundError,
@@ -34,8 +35,20 @@ class ConnectionsService:
             raise ConnectionTypeNotFoundError(f"Connection type {connection_type_id} not found")
         return connection_type
 
-    def list_connections(self) -> list[Connection]:
-        return list(self._db.execute(select(Connection).order_by(Connection.name)).scalars())
+    def list_connections(self, *, is_active: bool | None = None) -> list[Connection]:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=settings.INACTIVE_RECORD_VISIBILITY_DAYS)
+        # Same visibility-cutoff rule as DataSourcesService.list_data_sources:
+        # inactive longer than the cutoff (or deactivated_at unknown/NULL) is
+        # excluded regardless of is_active — hidden from every list view,
+        # never removed from the database.
+        stmt = (
+            select(Connection)
+            .where(or_(Connection.is_active.is_(True), Connection.deactivated_at >= cutoff))
+            .order_by(Connection.name)
+        )
+        if is_active is not None:
+            stmt = stmt.where(Connection.is_active.is_(is_active))
+        return list(self._db.execute(stmt).scalars())
 
     def get_connection(self, connection_id: uuid.UUID) -> Connection:
         connection = self._db.get(Connection, connection_id)
@@ -155,8 +168,10 @@ class ConnectionsService:
 
     def deactivate_connection(self, *, actor: User, connection_id: uuid.UUID) -> Connection:
         connection = self.get_connection(connection_id)
+        deactivated_at = datetime.now(timezone.utc)
         connection.is_active = False
-        connection.updated_at = datetime.now(timezone.utc)
+        connection.deactivated_at = deactivated_at
+        connection.updated_at = deactivated_at
 
         self._audit.record(
             actor=actor,
@@ -186,6 +201,7 @@ class ConnectionsService:
             )
 
         connection.is_active = True
+        connection.deactivated_at = None
         connection.updated_at = datetime.now(timezone.utc)
 
         self._audit.record(
