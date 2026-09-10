@@ -89,6 +89,16 @@ PHASE12_PERMISSIONS = {"ai.chat", "ai.suggest"}
 PHASE5_RBAC_CORRECTION_UNIVERSAL_PERMISSIONS = {"rules.read", "rule_assignments.manage"}
 PHASE5_RBAC_CORRECTION_ADMIN_ONLY_PERMISSIONS = {"rules.manage"}
 
+# Permission seeded by migration 0018 for the new Data Preview endpoint
+# (GET /api/v1/datasets/{id}/preview). Granted to all five roles uniformly
+# — a pure read with no side effects, so it follows this project's
+# universal-read convention (metadata.read, profiling.run, validation.run,
+# etc. are all universal too) rather than the write/action-tier convention
+# that produces non-uniform splits (rules.manage, publish.execute, ...).
+# See that migration's docstring for the full reasoning — this is the
+# first permission gating raw source row content rather than metadata.
+DATA_PREVIEW_PERMISSIONS = {"data_preview.read"}
+
 ALL_ROLE_PERMISSIONS = (
     PHASE2_PERMISSIONS
     | PHASE3_PERMISSIONS
@@ -106,6 +116,7 @@ ALL_ROLE_PERMISSIONS = (
     | PHASE12_PERMISSIONS
     | PHASE5_RBAC_CORRECTION_UNIVERSAL_PERMISSIONS
     | PHASE5_RBAC_CORRECTION_ADMIN_ONLY_PERMISSIONS
+    | DATA_PREVIEW_PERMISSIONS
 )
 
 
@@ -144,7 +155,7 @@ def test_analyst_has_phase2_reads_plus_all_phase3_and_phase4_permissions(db: Ses
         "connections.read",
         "data_sources.read",
         "audit.read",
-    } | PHASE3_PERMISSIONS | PHASE4_PERMISSIONS | PHASE5_PERMISSIONS | PHASE6_PERMISSIONS | PHASE7_UNIVERSAL_PERMISSIONS | PHASE8_UNIVERSAL_PERMISSIONS | PHASE9_UNIVERSAL_PERMISSIONS | PHASE10_PERMISSIONS | PHASE11_PERMISSIONS | PHASE12_PERMISSIONS | PHASE5_RBAC_CORRECTION_UNIVERSAL_PERMISSIONS
+    } | PHASE3_PERMISSIONS | PHASE4_PERMISSIONS | PHASE5_PERMISSIONS | PHASE6_PERMISSIONS | PHASE7_UNIVERSAL_PERMISSIONS | PHASE8_UNIVERSAL_PERMISSIONS | PHASE9_UNIVERSAL_PERMISSIONS | PHASE10_PERMISSIONS | PHASE11_PERMISSIONS | PHASE12_PERMISSIONS | PHASE5_RBAC_CORRECTION_UNIVERSAL_PERMISSIONS | DATA_PREVIEW_PERMISSIONS
 
 
 def test_reviewer_has_only_phase3_through_phase6_plus_approval_read(db: Session) -> None:
@@ -164,6 +175,7 @@ def test_reviewer_has_only_phase3_through_phase6_plus_approval_read(db: Session)
         | PHASE11_PERMISSIONS
         | PHASE12_PERMISSIONS
         | PHASE5_RBAC_CORRECTION_UNIVERSAL_PERMISSIONS
+        | DATA_PREVIEW_PERMISSIONS
     )
 
 
@@ -186,6 +198,7 @@ def test_approver_has_reviewer_set_plus_approval_decide_and_staging_create_but_n
         | PHASE11_PERMISSIONS
         | PHASE12_PERMISSIONS
         | PHASE5_RBAC_CORRECTION_UNIVERSAL_PERMISSIONS
+        | DATA_PREVIEW_PERMISSIONS
     )
     assert _permission_codes_for_role(db, "approver") == expected
 
@@ -208,5 +221,6 @@ def test_publisher_has_approver_set_plus_publish_execute(db: Session) -> None:
         | PHASE10_PERMISSIONS
         | PHASE11_PERMISSIONS
         | PHASE5_RBAC_CORRECTION_UNIVERSAL_PERMISSIONS
+        | DATA_PREVIEW_PERMISSIONS
     )
     assert _permission_codes_for_role(db, "publisher") == expected

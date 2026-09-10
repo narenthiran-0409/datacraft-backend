@@ -85,3 +85,43 @@ def test_translate_error_ora_12154_maps_to_unreachable() -> None:
         assert False, "expected SourceUnreachableError"
     except SourceUnreachableError:
         pass
+
+
+def test_sample_rows_returns_rows_as_dicts_with_fetch_first_clause() -> None:
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider, fetchall_result=[(1, "a"), (2, "b")])
+    cur.description = [("ID",), ("VAL",)]
+
+    result = provider.sample_rows("APP_OWNER", "ORDERS", sample_size=20)
+
+    assert result.rows == [{"ID": 1, "VAL": "a"}, {"ID": 2, "VAL": "b"}]
+    assert result.is_full_scan is False
+    executed_sql = cur.execute.call_args[0][0]
+    assert "FETCH FIRST :row_limit ROWS ONLY" in executed_sql
+    assert '"APP_OWNER"."ORDERS"' in executed_sql
+    assert cur.execute.call_args.kwargs == {"row_limit": 20}
+
+
+def test_sample_rows_quotes_identifiers_containing_double_quotes() -> None:
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider, fetchall_result=[])
+    cur.description = []
+
+    provider.sample_rows('weird"owner', 'weird"table', sample_size=5)
+
+    executed_sql = cur.execute.call_args[0][0]
+    assert '"weird""owner"."weird""table"' in executed_sql
+
+
+def test_sample_rows_wraps_driver_error() -> None:
+    import oracledb
+    import pytest
+
+    from app.source_adapters.exceptions import SourceQueryError
+
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider)
+    cur.execute.side_effect = oracledb.Error("boom")
+
+    with pytest.raises(SourceQueryError):
+        provider.sample_rows("APP_OWNER", "ORDERS", sample_size=20)

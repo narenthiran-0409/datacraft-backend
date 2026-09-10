@@ -73,3 +73,43 @@ def test_translate_error_invalid_credentials_maps_to_authentication() -> None:
         assert False, "expected SourceAuthenticationError"
     except SourceAuthenticationError:
         pass
+
+
+def test_sample_rows_returns_rows_as_dicts_with_limit_clause() -> None:
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider, fetchall_result=[(1, "a"), (2, "b")])
+    cur.description = [("ID",), ("VAL",)]
+
+    result = provider.sample_rows("APP", "ORDERS", sample_size=20)
+
+    assert result.rows == [{"ID": 1, "VAL": "a"}, {"ID": 2, "VAL": "b"}]
+    assert result.is_full_scan is False
+    executed_sql, params = cur.execute.call_args[0]
+    assert "LIMIT ?" in executed_sql
+    assert '"APP"."ORDERS"' in executed_sql
+    assert params == (20,)
+
+
+def test_sample_rows_quotes_identifiers_containing_double_quotes() -> None:
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider, fetchall_result=[])
+    cur.description = []
+
+    provider.sample_rows('weird"schema', 'weird"table', sample_size=5)
+
+    executed_sql = cur.execute.call_args[0][0]
+    assert '"weird""schema"."weird""table"' in executed_sql
+
+
+def test_sample_rows_wraps_driver_error() -> None:
+    from hdbcli import dbapi
+    import pytest
+
+    from app.source_adapters.exceptions import SourceQueryError
+
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider)
+    cur.execute.side_effect = dbapi.Error("boom")
+
+    with pytest.raises(SourceQueryError):
+        provider.sample_rows("APP", "ORDERS", sample_size=20)

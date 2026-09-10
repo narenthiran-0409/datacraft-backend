@@ -82,6 +82,19 @@ def _normalize_type(native_type: str, data_scale: int | None) -> str:
     return _TYPE_MAP_SIMPLE.get(native_type, "STRING")
 
 
+def _quote_ident(name: str) -> str:
+    """Double-quotes an Oracle identifier, doubling any internal double
+    quote — the standard Oracle escaping rule, and also preserves exact
+    case (an unquoted identifier would be folded to uppercase, which could
+    mismatch the case ALL_TABLES/ALL_TAB_COLUMNS actually reported)."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _rows_as_dicts(cur) -> list[dict[str, Any]]:
+    columns = [col[0] for col in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
 class OracleProvider(SourceDatabaseProvider):
     def __init__(
         self,
@@ -292,8 +305,18 @@ class OracleProvider(SourceDatabaseProvider):
     def get_dataset_column_stats(self, schema: str, table: str, columns: list[str]) -> dict[str, ColumnExactStats]:
         raise NotImplementedError("Implemented in a later phase")
 
+    @with_timeout(settings.PROFILING_QUERY_TIMEOUT_SECONDS)
     def sample_rows(self, schema: str, table: str, sample_size: int) -> SampleResult:
-        raise NotImplementedError("Implemented in a later phase")
+        try:
+            cur = self._connection().cursor()
+            query = (
+                f"SELECT * FROM {_quote_ident(schema)}.{_quote_ident(table)} "
+                "FETCH FIRST :row_limit ROWS ONLY"
+            )
+            cur.execute(query, row_limit=sample_size)
+            return SampleResult(rows=_rows_as_dicts(cur), is_full_scan=False)
+        except oracledb.Error as exc:
+            raise SourceQueryError(str(exc)) from exc
 
     def fetch_rows_by_keys(self, schema: str, table: str, keys: list[dict[str, Any]]) -> list[dict[str, Any]]:
         raise NotImplementedError("Implemented in a later phase")

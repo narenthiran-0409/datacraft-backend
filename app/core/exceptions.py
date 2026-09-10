@@ -328,6 +328,28 @@ class AIPromptVersionNotFoundError(NotFoundError):
     code = "AI_PROMPT_VERSION_NOT_FOUND"
 
 
+class PreviewSourceUnavailableError(AppError):
+    """The live source connection could not be established or the preview
+    query failed (auth rejected, host unreachable, SSL negotiation failed,
+    credential vault unreachable, driver not installed, or the query itself
+    failed — e.g. the table was renamed/dropped at the source since it was
+    last discovered). Mirrors CredentialVaultError's 502: this project's
+    convention for "an external dependency we tried to reach failed"."""
+
+    code = "PREVIEW_SOURCE_UNAVAILABLE"
+    status_code = status.HTTP_502_BAD_GATEWAY
+
+
+class PreviewTimeoutError(AppError):
+    """The live preview query did not complete within the bounded timeout.
+    Kept distinct from PreviewSourceUnavailableError (rather than folded
+    into the same bucket) because "too slow right now" and "genuinely
+    broken" warrant different frontend retry behavior."""
+
+    code = "PREVIEW_TIMEOUT"
+    status_code = status.HTTP_504_GATEWAY_TIMEOUT
+
+
 def _error_envelope(code: str, message: str, details: dict) -> dict:
     request_id = get_request_id()
     return {

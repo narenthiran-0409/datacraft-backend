@@ -70,6 +70,17 @@ def _normalize_type(native_type: str) -> str:
     return _TYPE_MAP.get((native_type or "").upper(), "STRING")
 
 
+def _quote_ident(name: str) -> str:
+    """Double-quotes a SAP HANA identifier, doubling any internal double
+    quote — the standard ANSI/HANA escaping rule (same as Oracle's)."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _rows_as_dicts(cur) -> list[dict[str, Any]]:
+    columns = [col[0] for col in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
 class SAPHanaProvider(SourceDatabaseProvider):
     def __init__(
         self,
@@ -267,8 +278,15 @@ class SAPHanaProvider(SourceDatabaseProvider):
     def get_dataset_column_stats(self, schema: str, table: str, columns: list[str]) -> dict[str, ColumnExactStats]:
         raise NotImplementedError("Implemented in a later phase")
 
+    @with_timeout(settings.PROFILING_QUERY_TIMEOUT_SECONDS)
     def sample_rows(self, schema: str, table: str, sample_size: int) -> SampleResult:
-        raise NotImplementedError("Implemented in a later phase")
+        try:
+            cur = self._connection().cursor()
+            query = f"SELECT * FROM {_quote_ident(schema)}.{_quote_ident(table)} LIMIT ?"
+            cur.execute(query, (sample_size,))
+            return SampleResult(rows=_rows_as_dicts(cur), is_full_scan=False)
+        except dbapi.Error as exc:
+            raise SourceQueryError(str(exc)) from exc
 
     def fetch_rows_by_keys(self, schema: str, table: str, keys: list[dict[str, Any]]) -> list[dict[str, Any]]:
         raise NotImplementedError("Implemented in a later phase")

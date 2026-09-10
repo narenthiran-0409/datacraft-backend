@@ -78,3 +78,43 @@ def test_translate_error_access_denied_maps_to_authentication() -> None:
         assert False, "expected SourceAuthenticationError"
     except SourceAuthenticationError:
         pass
+
+
+def test_sample_rows_returns_rows_as_dicts_with_limit_clause() -> None:
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider, fetchall_result=[(1, "a"), (2, "b")])
+    cur.description = [("id",), ("val",)]
+
+    result = provider.sample_rows("app_db", "orders", sample_size=20)
+
+    assert result.rows == [{"id": 1, "val": "a"}, {"id": 2, "val": "b"}]
+    assert result.is_full_scan is False
+    executed_sql, params = cur.execute.call_args[0]
+    assert "LIMIT %s" in executed_sql
+    assert "`app_db`.`orders`" in executed_sql
+    assert params == (20,)
+
+
+def test_sample_rows_quotes_identifiers_containing_backticks() -> None:
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider, fetchall_result=[])
+    cur.description = []
+
+    provider.sample_rows("weird`schema", "weird`table", sample_size=5)
+
+    executed_sql = cur.execute.call_args[0][0]
+    assert "`weird``schema`.`weird``table`" in executed_sql
+
+
+def test_sample_rows_wraps_driver_error() -> None:
+    import pytest
+    import pymysql
+
+    from app.source_adapters.exceptions import SourceQueryError
+
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider)
+    cur.execute.side_effect = pymysql.MySQLError("boom")
+
+    with pytest.raises(SourceQueryError):
+        provider.sample_rows("app_db", "orders", sample_size=20)

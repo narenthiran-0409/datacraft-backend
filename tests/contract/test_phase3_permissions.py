@@ -18,6 +18,7 @@ PERMISSION_ROUTES = [
     ("GET", f"/api/v1/datasets/{RANDOM_ID}/columns", None),
     ("PUT", f"/api/v1/datasets/{RANDOM_ID}/key-columns", {"columns": [{"column_id": RANDOM_ID, "ordinal": 0}]}),
     ("PATCH", f"/api/v1/datasets/{RANDOM_ID}", {"is_active": False}),
+    ("GET", f"/api/v1/datasets/{RANDOM_ID}/preview", None),
 ]
 
 

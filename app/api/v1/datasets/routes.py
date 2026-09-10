@@ -7,14 +7,19 @@ from app.api.v1.datasets.schemas import (
     ColumnResponse,
     DatasetListResponse,
     DatasetPatchRequest,
+    DatasetPreviewResponse,
     DatasetResponse,
     KeyColumnsRequest,
     SchemaResponse,
 )
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.dependencies import require_permission
+from app.core.redis_client import get_redis_client
 from app.db.models import User
+from app.modules.connections.credential_vault import CredentialVaultClient, LocalRedisVaultClient
 from app.modules.datasets.key_service import DatasetKeyService
+from app.modules.datasets.preview_service import PREVIEW_DEFAULT_ROWS, PreviewService
 from app.modules.datasets.service import DatasetService
 
 router = APIRouter(tags=["datasets"])
@@ -26,6 +31,14 @@ def get_dataset_service(db: Session = Depends(get_db)) -> DatasetService:
 
 def get_dataset_key_service(db: Session = Depends(get_db)) -> DatasetKeyService:
     return DatasetKeyService(db)
+
+
+def get_vault_client() -> CredentialVaultClient:
+    return LocalRedisVaultClient(get_redis_client(), settings.VAULT_LOCAL_ENCRYPTION_KEY)
+
+
+def get_preview_service(db: Session = Depends(get_db)) -> PreviewService:
+    return PreviewService(db, get_vault_client(), get_redis_client())
 
 
 @router.get("/schemas", response_model=list[SchemaResponse])
@@ -74,6 +87,21 @@ def get_dataset_columns(
     _: User = Depends(require_permission("metadata.read")),
 ) -> list[ColumnResponse]:
     return [ColumnResponse.model_validate(c) for c in service.get_columns(dataset_id)]
+
+
+@router.get("/datasets/{dataset_id}/preview", response_model=DatasetPreviewResponse)
+def preview_dataset(
+    dataset_id: uuid.UUID,
+    row_count: int = Query(default=PREVIEW_DEFAULT_ROWS, ge=1),
+    service: PreviewService = Depends(get_preview_service),
+    current_user: User = Depends(require_permission("data_preview.read")),
+) -> DatasetPreviewResponse:
+    """Live read against the actual source database via the dataset's
+    connection — never this platform's own tables. row_count is silently
+    clamped to PREVIEW_MAX_ROWS regardless of what's requested; see
+    PreviewService for why that's a clamp, not a 422 rejection."""
+    result = service.preview_dataset(actor=current_user, dataset_id=dataset_id, requested_row_count=row_count)
+    return DatasetPreviewResponse(**result)
 
 
 @router.put("/datasets/{dataset_id}/key-columns", response_model=DatasetResponse)

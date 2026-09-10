@@ -137,9 +137,12 @@ non-local deployment.
 `app/source_adapters/` abstracts source database connectivity behind
 `SourceDatabaseProvider`: `test_connection`, `get_capabilities`,
 `list_schemas`, `list_datasets`, `get_columns`, `get_primary_keys`,
-`get_foreign_keys`, `get_row_count` are implemented for all five vendors;
-`sample_rows`/`fetch_rows_by_keys` remain `NotImplementedError` (out of
-scope until a later phase). Every method is wrapped in a bounded timeout
+`get_foreign_keys`, `get_row_count`, and `sample_rows` are implemented for
+all five vendors (`sample_rows` most recently — added for Data Preview,
+see below). `fetch_rows_by_keys` is implemented for PostgreSQL only
+(Staging's batched re-fetch); the other four remain `NotImplementedError`
+— out of scope until Staging needs them for a non-Postgres source. Every
+method is wrapped in a bounded timeout
 (`DISCOVERY_QUERY_TIMEOUT_SECONDS`, `app/source_adapters/timeout.py`).
 `get_row_count` always uses a cheap catalog-statistics estimate (Postgres
 `pg_class.reltuples`, SQL Server `sys.partitions.rows`, MySQL
@@ -153,7 +156,7 @@ in production:**
 
 | Provider | Driver | Verification |
 |---|---|---|
-| `PostgreSQLProvider` | `psycopg` (already in use since Phase 1/2) | **Live-verified** against a real local Postgres instance (integration tests + manual verification) |
+| `PostgreSQLProvider` | `psycopg` (already in use since Phase 1/2) | **Live-verified** against a real local Postgres instance (integration tests + manual verification), including `sample_rows` |
 | `SQLServerProvider` | `pyodbc` | **Mock-only** — no live SQL Server instance available in this environment |
 | `MySQLProvider` | `pymysql` | **Mock-only** — no live MySQL instance available in this environment |
 | `OracleProvider` | `python-oracledb` (thin mode — no Oracle Instant Client needed) | **Mock-only** — no live Oracle instance available in this environment |
@@ -233,6 +236,46 @@ that Discovery's automatic path uses, so both paths stay behaviorally
 identical by construction. `PATCH /api/v1/datasets/{id}` (`{is_active:
 bool}`, same permission) manually overrides the auto-managed
 deactivation.
+
+## Data Preview
+
+`GET /api/v1/datasets/{id}/preview?row_count=N` (permission
+`data_preview.read` — see below, deliberately **not** `metadata.read`)
+runs a live, bounded, read-only `sample_rows()` query against the
+dataset's actual source database — the one endpoint under `/datasets/`
+that calls a source-database provider synchronously in the request path
+(same pattern as `POST /connections/{id}/test`, no Celery job). `row_count`
+defaults to 20 and is **silently clamped** to 100 regardless of what's
+requested — a deliberate departure from Profiling's "never silently
+downgrade, reject with 422 instead" philosophy, since a preview's exact
+row count has no downstream statistical meaning the way a profiling
+sample's does. String values in the returned rows are each truncated to
+100 characters, mirroring Profiling's `top_values` truncation precedent
+(`app/modules/profiling/engine.py`).
+
+`data_preview.read` is a dedicated permission (migration 0018), not a
+reuse of `metadata.read` — this endpoint returns actual raw row content
+pulled live from the source, meaningfully more sensitive than the
+column-name/type/count metadata `metadata.read` has ever gated. It's
+granted to all five roles (a pure read, so it follows this project's
+universal-read convention — see the migration's docstring for the full
+reasoning), but that default is a real access-control decision worth
+reviewing, not an assumption.
+
+Every preview attempt — success or failure — writes an `audit_events` row
+(`dataset.previewed` / `dataset.preview_failed`), **never** containing the
+actual row values, only counts/schema/table names and, on failure, the
+categorized error message. A live-source failure (unreachable/auth/SSL/
+timeout/credential-vault/query-failed — e.g. the table was renamed or
+dropped at the source since it was last discovered) is caught and mapped
+to a controlled `502 PREVIEW_SOURCE_UNAVAILABLE` (or `504 PREVIEW_TIMEOUT`
+for a timeout specifically), never a raw unhandled 500.
+
+`sample_rows()` for the four non-Postgres providers was implemented as
+part of this feature for structural completeness — matching the ABC
+contract, unit-tested against mocked cursors — but remains **mock-only,
+unverified against a live instance**, exactly like every other method on
+those four providers. See "Source adapters" above.
 
 ## Configuration
 

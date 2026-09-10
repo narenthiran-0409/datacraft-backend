@@ -81,3 +81,43 @@ def test_translate_error_login_failed_maps_to_authentication() -> None:
         assert False, "expected SourceAuthenticationError"
     except SourceAuthenticationError:
         pass
+
+
+def test_sample_rows_returns_rows_as_dicts_with_top_clause() -> None:
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider, fetchall_result=[(1, "a"), (2, "b")])
+    cur.description = [("id",), ("val",)]
+
+    result = provider.sample_rows("dbo", "orders", sample_size=20)
+
+    assert result.rows == [{"id": 1, "val": "a"}, {"id": 2, "val": "b"}]
+    assert result.is_full_scan is False
+    executed_sql, param = cur.execute.call_args[0]
+    assert "SELECT TOP (?)" in executed_sql
+    assert "[dbo].[orders]" in executed_sql
+    assert param == 20
+
+
+def test_sample_rows_quotes_identifiers_containing_brackets() -> None:
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider, fetchall_result=[])
+    cur.description = []
+
+    provider.sample_rows("weird]schema", "weird]table", sample_size=5)
+
+    executed_sql = cur.execute.call_args[0][0]
+    assert "[weird]]schema].[weird]]table]" in executed_sql
+
+
+def test_sample_rows_wraps_driver_error() -> None:
+    import pyodbc
+    import pytest
+
+    from app.source_adapters.exceptions import SourceQueryError
+
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider)
+    cur.execute.side_effect = pyodbc.Error("boom")
+
+    with pytest.raises(SourceQueryError):
+        provider.sample_rows("dbo", "orders", sample_size=20)

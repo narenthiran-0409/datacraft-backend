@@ -72,6 +72,21 @@ def _normalize_type(native_type: str) -> str:
     return _TYPE_MAP.get(native_type.lower(), "STRING")
 
 
+def _quote_ident(name: str) -> str:
+    """Backtick-quotes a MySQL identifier, doubling any internal backtick —
+    the standard MySQL escaping rule. schema/table names here come from
+    this dataset's own discovered metadata (ultimately sourced from the
+    live database's own catalog, not raw HTTP input), but this is still a
+    real SQL-injection surface if interpolated unquoted, so it's quoted
+    the same way every other identifier-bearing query in this project is."""
+    return "`" + name.replace("`", "``") + "`"
+
+
+def _rows_as_dicts(cur) -> list[dict[str, Any]]:
+    columns = [col[0] for col in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
 class MySQLProvider(SourceDatabaseProvider):
     def __init__(
         self,
@@ -280,8 +295,15 @@ class MySQLProvider(SourceDatabaseProvider):
     def get_dataset_column_stats(self, schema: str, table: str, columns: list[str]) -> dict[str, ColumnExactStats]:
         raise NotImplementedError("Implemented in a later phase")
 
+    @with_timeout(settings.PROFILING_QUERY_TIMEOUT_SECONDS)
     def sample_rows(self, schema: str, table: str, sample_size: int) -> SampleResult:
-        raise NotImplementedError("Implemented in a later phase")
+        try:
+            with self._connection().cursor() as cur:
+                query = f"SELECT * FROM {_quote_ident(schema)}.{_quote_ident(table)} LIMIT %s"
+                cur.execute(query, (sample_size,))
+                return SampleResult(rows=_rows_as_dicts(cur), is_full_scan=False)
+        except pymysql.MySQLError as exc:
+            raise SourceQueryError(str(exc)) from exc
 
     def fetch_rows_by_keys(self, schema: str, table: str, keys: list[dict[str, Any]]) -> list[dict[str, Any]]:
         raise NotImplementedError("Implemented in a later phase")

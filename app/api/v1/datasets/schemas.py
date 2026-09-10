@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -70,3 +71,20 @@ class KeyColumnsRequest(BaseModel):
 
 class DatasetPatchRequest(BaseModel):
     is_active: bool
+
+
+class DatasetPreviewResponse(BaseModel):
+    """Live rows pulled directly from the source database, never from any
+    table this platform owns. String values in `rows` are each truncated
+    to 100 characters (see PreviewService). `capped_to_max` is True when
+    `requested_row_count` exceeded the server-enforced cap (100) and was
+    silently reduced."""
+
+    dataset_id: uuid.UUID
+    schema_name: str
+    table_name: str
+    columns: list[str]
+    rows: list[dict[str, Any]]
+    row_count: int
+    requested_row_count: int
+    capped_to_max: bool = False
