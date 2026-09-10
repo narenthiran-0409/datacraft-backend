@@ -116,6 +116,15 @@ def deactivate_connection(
     return ConnectionResponse.model_validate(service.deactivate_connection(actor=current_user, connection_id=connection_id))
 
 
+@router.post("/connections/{connection_id}/reactivate", response_model=ConnectionResponse)
+def reactivate_connection(
+    connection_id: uuid.UUID,
+    service: ConnectionsService = Depends(get_connections_service),
+    current_user: User = Depends(require_permission("connections.manage")),
+) -> ConnectionResponse:
+    return ConnectionResponse.model_validate(service.reactivate_connection(actor=current_user, connection_id=connection_id))
+
+
 @router.post("/connections/{connection_id}/test", response_model=ConnectionResponse)
 def test_connection(
     connection_id: uuid.UUID,

@@ -74,3 +74,13 @@ def deactivate_data_source(
 ) -> DataSourceResponse:
     data_source = service.deactivate_data_source(actor=current_user, data_source_id=data_source_id)
     return DataSourceResponse.model_validate(data_source)
+
+
+@router.post("/{data_source_id}/reactivate", response_model=DataSourceResponse)
+def reactivate_data_source(
+    data_source_id: uuid.UUID,
+    service: DataSourcesService = Depends(get_data_sources_service),
+    current_user: User = Depends(require_permission("data_sources.manage")),
+) -> DataSourceResponse:
+    data_source = service.reactivate_data_source(actor=current_user, data_source_id=data_source_id)
+    return DataSourceResponse.model_validate(data_source)

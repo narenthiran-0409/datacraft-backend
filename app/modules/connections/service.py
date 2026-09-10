@@ -8,8 +8,9 @@ from app.core.exceptions import (
     ConnectionNameAlreadyExistsError,
     ConnectionNotFoundError,
     ConnectionTypeNotFoundError,
+    DataSourceNotActiveError,
 )
-from app.db.models import Connection, ConnectionType, User
+from app.db.models import Connection, ConnectionType, DataSource, User
 from app.modules.audit.service import AuditingService
 from app.modules.connections.credential_vault import CredentialVaultClient
 from app.modules.lineage.service import LineageService
@@ -160,6 +161,36 @@ class ConnectionsService:
         self._audit.record(
             actor=actor,
             action="connection.deleted",
+            entity_type="CONNECTION",
+            entity_id=connection.id,
+        )
+        self._db.commit()
+        self._db.refresh(connection)
+        return connection
+
+    def reactivate_connection(self, *, actor: User, connection_id: uuid.UUID) -> Connection:
+        connection = self.get_connection(connection_id)
+
+        # A connection's parent data source can itself be deactivated (data
+        # sources only refuse deactivation while they still have active
+        # connections — see DataSourcesService.deactivate_data_source's
+        # active_connection_count guard). Reactivating a connection whose
+        # data source is inactive would leave an active connection hanging
+        # off an inactive data source, the exact inverted-parent state that
+        # guard exists to prevent — so it's refused here instead.
+        data_source = self._db.get(DataSource, connection.data_source_id)
+        if not data_source.is_active:
+            raise DataSourceNotActiveError(
+                f"Cannot reactivate connection {connection_id}: parent data source "
+                f"{connection.data_source_id} is not active; reactivate the data source first"
+            )
+
+        connection.is_active = True
+        connection.updated_at = datetime.now(timezone.utc)
+
+        self._audit.record(
+            actor=actor,
+            action="connection.reactivated",
             entity_type="CONNECTION",
             entity_id=connection.id,
         )

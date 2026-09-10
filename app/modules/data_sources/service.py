@@ -127,3 +127,18 @@ class DataSourcesService:
         self._db.commit()
         self._db.refresh(data_source)
         return data_source
+
+    def reactivate_data_source(self, *, actor: User, data_source_id: uuid.UUID) -> DataSource:
+        data_source = self.get_data_source(data_source_id)
+        data_source.is_active = True
+        data_source.updated_at = datetime.now(timezone.utc)
+
+        self._audit.record(
+            actor=actor,
+            action="data_source.reactivated",
+            entity_type="DATA_SOURCE",
+            entity_id=data_source.id,
+        )
+        self._db.commit()
+        self._db.refresh(data_source)
+        return data_source

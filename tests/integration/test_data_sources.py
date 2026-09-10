@@ -64,3 +64,19 @@ def test_deactivate_data_source_without_connections_succeeds(db: Session, admin_
         select(AuditEvent).where(AuditEvent.entity_id == data_source.id, AuditEvent.action == "data_source.deactivated")
     ).scalars().all()
     assert len(events) == 1
+
+
+def test_reactivate_data_source_audits(db: Session, admin_user) -> None:
+    service = DataSourcesService(db)
+    data_source = service.create_data_source(
+        actor=admin_user, name="Reactivate Me DB", description=None, owner_team=None, business_domain=None,
+    )
+    service.deactivate_data_source(actor=admin_user, data_source_id=data_source.id)
+
+    reactivated = service.reactivate_data_source(actor=admin_user, data_source_id=data_source.id)
+    assert reactivated.is_active is True
+
+    events = db.execute(
+        select(AuditEvent).where(AuditEvent.entity_id == data_source.id, AuditEvent.action == "data_source.reactivated")
+    ).scalars().all()
+    assert len(events) == 1

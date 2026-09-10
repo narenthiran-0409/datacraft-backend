@@ -72,6 +72,11 @@ class DataSourceHasActiveConnectionsError(AppError):
     status_code = status.HTTP_409_CONFLICT
 
 
+class DataSourceNotActiveError(AppError):
+    code = "DATA_SOURCE_NOT_ACTIVE"
+    status_code = status.HTTP_409_CONFLICT
+
+
 class ConnectionNotFoundError(NotFoundError):
     code = "CONNECTION_NOT_FOUND"
 

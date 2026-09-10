@@ -3,7 +3,7 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.exceptions import ConnectionNameAlreadyExistsError
+from app.core.exceptions import ConnectionNameAlreadyExistsError, DataSourceNotActiveError
 from app.db.models import AuditEvent, ConnectionType
 from app.modules.connections.credential_vault import LocalRedisVaultClient
 from app.modules.connections.service import ConnectionsService
@@ -114,3 +114,38 @@ def test_deactivate_connection_audits(db: Session, redis_client, admin_user) -> 
         select(AuditEvent).where(AuditEvent.entity_id == connection.id, AuditEvent.action == "connection.deleted")
     ).scalars().all()
     assert len(events) == 1
+
+
+def test_reactivate_connection_audits(db: Session, redis_client, admin_user) -> None:
+    ds = DataSourcesService(db).create_data_source(actor=admin_user, name="DS6", description=None, owner_team=None, business_domain=None)
+    service = _connections_service(db, redis_client)
+    connection = service.create_connection(
+        actor=admin_user, data_source_id=ds.id, connection_type_id=_pg_type(db).id, name="conn6",
+        environment="DEV", host="localhost", port=5432, database_name="db1", service_name=None,
+        username="svc", credential={"username": "svc", "password": "pw"}, config={},
+    )
+    service.deactivate_connection(actor=admin_user, connection_id=connection.id)
+
+    reactivated = service.reactivate_connection(actor=admin_user, connection_id=connection.id)
+    assert reactivated.is_active is True
+
+    events = db.execute(
+        select(AuditEvent).where(AuditEvent.entity_id == connection.id, AuditEvent.action == "connection.reactivated")
+    ).scalars().all()
+    assert len(events) == 1
+
+
+def test_reactivate_connection_rejected_when_data_source_inactive(db: Session, redis_client, admin_user) -> None:
+    ds_service = DataSourcesService(db)
+    ds = ds_service.create_data_source(actor=admin_user, name="DS7", description=None, owner_team=None, business_domain=None)
+    service = _connections_service(db, redis_client)
+    connection = service.create_connection(
+        actor=admin_user, data_source_id=ds.id, connection_type_id=_pg_type(db).id, name="conn7",
+        environment="DEV", host="localhost", port=5432, database_name="db1", service_name=None,
+        username="svc", credential={"username": "svc", "password": "pw"}, config={},
+    )
+    service.deactivate_connection(actor=admin_user, connection_id=connection.id)
+    ds_service.deactivate_data_source(actor=admin_user, data_source_id=ds.id)
+
+    with pytest.raises(DataSourceNotActiveError):
+        service.reactivate_connection(actor=admin_user, connection_id=connection.id)

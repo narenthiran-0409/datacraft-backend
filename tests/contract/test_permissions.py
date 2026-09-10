@@ -20,6 +20,7 @@ PERMISSION_ROUTES = [
     ("GET", f"/api/v1/data-sources/{RANDOM_ID}", None),
     ("PUT", f"/api/v1/data-sources/{RANDOM_ID}", {"description": "X"}),
     ("DELETE", f"/api/v1/data-sources/{RANDOM_ID}", None),
+    ("POST", f"/api/v1/data-sources/{RANDOM_ID}/reactivate", None),
     ("GET", "/api/v1/connection-types", None),
     ("GET", "/api/v1/connections", None),
     (
@@ -38,6 +39,7 @@ PERMISSION_ROUTES = [
     ("GET", f"/api/v1/connections/{RANDOM_ID}", None),
     ("PUT", f"/api/v1/connections/{RANDOM_ID}", {"host": "127.0.0.1"}),
     ("DELETE", f"/api/v1/connections/{RANDOM_ID}", None),
+    ("POST", f"/api/v1/connections/{RANDOM_ID}/reactivate", None),
     ("POST", f"/api/v1/connections/{RANDOM_ID}/test", None),
 ]
 
