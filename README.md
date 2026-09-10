@@ -83,6 +83,16 @@ requires the `administrator` role to already exist (seeded by migration
 
 ## Run tests
 
+**One-time setup**, in addition to the dev database above — tests run
+against a completely separate `dataquality_test` database, never the dev
+one (see "Test database isolation" below). Provision it once:
+
+```
+psql -U postgres -h localhost -f scripts/setup_test_postgres.sql
+```
+
+Then:
+
 ```bash
 pytest
 ```
@@ -102,6 +112,37 @@ pytest
 Integration/contract/e2e tests require a real reachable Postgres and Redis
 (see above) — they are not mocked, since proving real connectivity and
 constraint enforcement is the point.
+
+### Test database isolation
+
+`tests/conftest.py` force-overrides `DATABASE_URL` to `<dev database
+name>_test` (so `dataquality` → `dataquality_test`) **before any
+application module is imported** — this has to happen that early because
+`app/core/database.py`'s `engine` is built from `settings.DATABASE_URL` at
+first import, and `app/core/config.py`'s `settings` is `@lru_cache`d, so
+overriding the environment variable any later would have no effect. This
+override is unconditional: it doesn't matter what a developer's `.env`
+happens to say, because tests never read `DATABASE_URL` for their own
+connection at all — only to derive the `_test` name from it. A
+session-scoped fixture also hard-refuses to run at all if, for any reason,
+the resolved database name doesn't end in `_test`.
+
+This isolation exists because it was missing before, and the consequences
+were real: the shared dev `dataquality` database was repeatedly damaged by
+test runs — a truncated `users` table mid-session, a Postgres deadlock
+from an orphaned test connection, and eventually a full wipe down to only
+migration-seeded reference data. The `db` fixture (`tests/conftest.py`)
+`TRUNCATE`s ~30 core tables at the start of every test that uses it — a
+deliberate, necessary part of test isolation *between tests*, which is
+exactly what made it so damaging when it ran against the real dev database
+instead of a disposable one.
+
+The test database is never auto-created (that would need `CREATEDB`
+granted to `dq_user`, which this project deliberately doesn't do — see
+`scripts/setup_test_postgres.sql`'s own comment on why). It *is*
+auto-migrated to head at the start of every test session, so there's no
+separate `alembic upgrade head` step to remember for the test database
+the way there is for the dev one.
 
 ## Authentication & RBAC
 
