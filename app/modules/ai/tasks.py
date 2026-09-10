@@ -40,7 +40,14 @@ def _run_ai_job(job_id: str, work) -> dict:
             db.commit()
             return {"status": "FAILED", "error": str(exc)}
 
-        jobs_service.mark_completed(job.id)
+        # BUG FIX: `result` (e.g. {"ai_suggestion_id": "..."}) used to be returned
+        # only as this Celery task's own return value, landing in Celery's internal
+        # result backend keyed by Celery's own task id — never exposed to any
+        # client, and distinct from job.id (the id actually returned by the trigger
+        # endpoint). Persisted onto the job row itself (migration 0019) so
+        # GET /jobs/{job_id} can actually resolve which ai_suggestions row this
+        # job produced.
+        jobs_service.mark_completed(job.id, result=result)
         db.commit()
         return {"status": "COMPLETED", **result}
     finally:

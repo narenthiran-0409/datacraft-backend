@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import ForeignKey, Integer, SmallInteger, Text, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -18,6 +19,11 @@ class Job(UUIDPKMixin, Base):
     status: Mapped[str] = mapped_column(Text, nullable=False, default="QUEUED", server_default="QUEUED")
     progress_percentage: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Additive (migration 0019) — the AI_SUGGESTION job type's Celery tasks were
+    # already computing {"ai_suggestion_id": ...} but had nowhere to put it: only
+    # Celery's own internal result backend (keyed by a task id never exposed to any
+    # client), not this row. Other job types leave this null.
+    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     queued_at: Mapped[datetime] = mapped_column(nullable=False, server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(nullable=True)

@@ -63,13 +63,19 @@ class JobsService:
         self._db.commit()
         return job
 
-    def mark_completed(self, job_id: uuid.UUID, error_message: str | None = None) -> Job:
+    def mark_completed(
+        self, job_id: uuid.UUID, error_message: str | None = None, result: dict | None = None
+    ) -> Job:
         job = self.get(job_id)
         now = datetime.now(timezone.utc)
         job.status = "COMPLETED"
         job.completed_at = now
         job.updated_at = now
         job.error_message = error_message
+        # Additive (migration 0019) — optional, defaults to None; every existing
+        # caller that doesn't pass it behaves exactly as before.
+        if result is not None:
+            job.result = result
         self._db.commit()
         return job
 
