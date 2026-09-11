@@ -1,4 +1,4 @@
-"""IMPORTANT — test/dev database isolation.
+"""IMPORTANT — test/dev database and Redis isolation.
 
 Before this override existed, tests connected via the exact same
 DATABASE_URL/engine/SessionLocal as the real app (app/core/database.py:
@@ -24,6 +24,31 @@ isolation structural rather than a convention someone can forget: there
 is no DATABASE_URL value a developer can put in .env that makes pytest
 touch the real dev database, because pytest never reads that value for
 its own connection — only to derive the *_test name from it.
+
+REDIS_URL gets the exact same treatment, for the exact same reason and
+with the exact same real incident behind it: the `redis_client` fixture
+below flushdb()s at the start AND end of every test that uses it
+(tests/integration/*, heavily), and before this override existed that ran
+against the real dev Redis (app/core/redis_client.py: `get_redis_client()`
+-> `redis.Redis.from_url(settings.REDIS_URL, ...)`, `@lru_cache`d exactly
+like `settings`/`engine` above, so it has the same "must override before
+first import" constraint) — every connection credential
+(LocalRedisVaultClient), every user's refresh token (RefreshTokenStore),
+and job-cancellation flags all live there. This is confirmed, not
+hypothetical: a full test run flushed the real dev Redis mid-task,
+wiping every stored connection credential.
+
+Redis has no equivalent to a `_test`-suffixed *name* to append to — only
+16 numbered logical databases (0-15) selected by the URL's path index, no
+per-database naming at all. This project's real Redis usage already
+claims the first three (app/core/config.py): REDIS_URL defaults to db 0,
+CELERY_BROKER_URL to db 1, CELERY_RESULT_BACKEND to db 2. So the fixed
+point this override forces onto REDIS_URL isn't a derived "<original>_test"
+name, it's a hardcoded, reserved index — 15, Redis's highest standard
+logical database and not used by anything else in this project — chosen
+specifically to avoid colliding with any of those three real ones, not
+just db 0. Forced the same way: always, unconditionally, before any
+`app.*` import, regardless of what a developer's .env says.
 """
 import os
 import uuid
@@ -40,10 +65,16 @@ _dev_database_url = os.environ.get(
 if not _dev_database_url.rsplit("/", 1)[-1].endswith("_test"):
     os.environ["DATABASE_URL"] = _dev_database_url.rsplit("/", 1)[0] + "/" + _dev_database_url.rsplit("/", 1)[-1] + "_test"
 
+_TEST_REDIS_DB_INDEX = "15"
+_dev_redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+if _dev_redis_url.rsplit("/", 1)[-1] != _TEST_REDIS_DB_INDEX:
+    os.environ["REDIS_URL"] = _dev_redis_url.rsplit("/", 1)[0] + "/" + _TEST_REDIS_DB_INDEX
+
 import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
+from redis.connection import parse_url as parse_redis_url
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
@@ -105,6 +136,43 @@ def _ensure_isolated_test_database() -> None:
 
     alembic_cfg = Config(str(_PROJECT_ROOT / "alembic.ini"))
     command.upgrade(alembic_cfg, "head")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _ensure_isolated_test_redis() -> None:
+    """Redis counterpart to _ensure_isolated_test_database above — same two
+    jobs, same rationale, same real incident behind it.
+
+    1. Hard safety tripwire — refuses to run at all if, despite the
+       override above, settings.REDIS_URL doesn't resolve to db index
+       _TEST_REDIS_DB_INDEX ("15"). Last line of defense against a test run
+       ever flushing/writing to the real dev Redis, in case the override
+       above is ever edited carelessly in the future. Every Redis access
+       point in this codebase (grepped: every module under app/) goes
+       through get_redis_client() -> settings.REDIS_URL — there is no other
+       path into Redis this tripwire would need to separately cover.
+    2. Confirms the reserved test database is actually reachable, the same
+       spirit as confirming the test Postgres database exists above —
+       Redis needs no migration/provisioning step (db 15 is just one of
+       the server's 16 default logical databases), so this is a plain
+       connectivity check with a clear, actionable message instead of a
+       confusing failure deep inside the first test that touches Redis.
+    """
+    resolved_db_index = parse_redis_url(settings.REDIS_URL).get("db")
+    if str(resolved_db_index) != _TEST_REDIS_DB_INDEX:
+        raise RuntimeError(
+            f"Refusing to run tests: REDIS_URL resolved to db index '{resolved_db_index}', "
+            f"not the reserved test index '{_TEST_REDIS_DB_INDEX}'. Tests must never run "
+            "against a non-test Redis database — see the top of tests/conftest.py."
+        )
+
+    try:
+        get_redis_client().ping()
+    except Exception as exc:  # noqa: BLE001 — any connection failure gets the same clear message
+        raise RuntimeError(
+            f"Refusing to run tests: could not reach the test Redis (REDIS_URL={settings.REDIS_URL!r}): {exc}"
+        ) from exc
+
 
 TRUNCATE_TABLES = (
     "ai_usage_logs, ai_suggestions, ai_messages, ai_conversations, ai_prompt_versions, "
