@@ -12,6 +12,7 @@ from app.core.exceptions import (
     InvalidRuleReviewTransitionError,
     RuleAssignmentNotFoundError,
     RuleNotFoundError,
+    RulePromotionNotSupportedError,
     RuleVersionNotFoundError,
     UnsupportedRuleTypeError,
 )
@@ -207,6 +208,74 @@ class RulesService:
         self._db.refresh(new_version)
         return new_version
 
+    def _resolve_promotion_assignment(
+        self, rule: Rule, rule_version: RuleVersion
+    ) -> tuple[str, uuid.UUID | None, uuid.UUID]:
+        """Derives (assignment_scope, column_id, dataset_id) for the
+        rule_assignment promote_rule() creates, from the detection
+        metadata RuleDetectionService/AISuggestionService actually write
+        into rule_version.definition["_detected_for"] — verified directly
+        against that code, not assumed: {dataset_id, column_id,
+        column_name, confidence[, ai_suggestion_id]}. Every detection this
+        codebase currently produces stores exactly one column_id — there
+        is no dataset-level or multi-column detection path today, so
+        scope is derived from rule_type against the validation engine's
+        real per-type semantics (app.modules.validation.engine), never
+        from a stored scope field (none exists):
+
+          - COMPLETENESS/UNIQUENESS/RANGE/PATTERN: their evaluators each
+            take a single column_name -> SINGLE_COLUMN, using the stored
+            column_id.
+          - DUPLICATE: evaluate_duplicate takes no column at all (it's a
+            whole-row check) -> DATASET_LEVEL; any stored column_id is
+            not used. (A DATASET_LEVEL COMPLETENESS/UNIQUENESS assignment
+            would still be silently skipped by _do_evaluation() — a
+            separate, still-open bug from an earlier investigation, not
+            fixed here — but that code path is never reached from this
+            method: COMPLETENESS/UNIQUENESS always resolve to
+            SINGLE_COLUMN above, never DATASET_LEVEL.)
+          - CROSS_COLUMN: evaluate_cross_column needs 2+ specific columns
+            via rule_assignment_columns, which detection never captures
+            (only one column_id is ever stored) — refused rather than
+            guessing a shape that wouldn't match what the evaluator
+            actually needs.
+
+        Also covers a rule that reached PENDING_REVIEW without ever going
+        through detection at all (e.g. an admin PATCHing status by hand
+        via the generic update_rule() endpoint, which doesn't validate
+        status transitions the way promote/dismiss do) — such a rule has
+        no _detected_for metadata, so this raises rather than promoting
+        it into an unassigned, silently-inert ACTIVE rule (the original
+        bug, reintroduced via a different path).
+        """
+        detected_for = (rule_version.definition or {}).get("_detected_for")
+        if not detected_for or not detected_for.get("dataset_id"):
+            raise RulePromotionNotSupportedError(
+                f"Rule {rule.id} has no recorded detection metadata (_detected_for) to derive its "
+                "assignment from — it wasn't created by the rule detector, so promote_rule() has no "
+                "way to know what dataset/column it should apply to. Create its assignment manually "
+                "via POST /rule-assignments instead."
+            )
+        dataset_id = uuid.UUID(detected_for["dataset_id"])
+
+        if rule.rule_type == "DUPLICATE":
+            return "DATASET_LEVEL", None, dataset_id
+        if rule.rule_type == "CROSS_COLUMN":
+            raise RulePromotionNotSupportedError(
+                f"Rule {rule.id} is CROSS_COLUMN, which needs 2+ specific columns "
+                "(rule_assignment_columns) — detection only ever records one column_id, so "
+                "promote_rule() cannot honestly reconstruct a valid CROSS_COLUMN assignment for it. "
+                "Create its assignment manually via POST /rule-assignments instead."
+            )
+
+        column_id_str = detected_for.get("column_id")
+        if not column_id_str:
+            raise RulePromotionNotSupportedError(
+                f"Rule {rule.id} (rule_type={rule.rule_type}) has no column_id recorded in its "
+                "detection metadata — cannot create a SINGLE_COLUMN assignment for it."
+            )
+        return "SINGLE_COLUMN", uuid.UUID(column_id_str), dataset_id
+
     def promote_rule(self, *, actor: User, rule_id: uuid.UUID) -> Rule:
         """The only path a PENDING_REVIEW rule (pattern-detected or
         AI-recommended) can ever take to become ACTIVE — always an
@@ -215,15 +284,60 @@ class RulesService:
         DISABLED rule is rejected rather than silently accepted, so this
         can't be used as a backdoor status-setter for rules outside the
         review workflow (RuleUpdateRequest/update_rule already covers
-        general status changes for those)."""
+        general status changes for those).
+
+        BUG FIX: promoting used to only flip rules.status to ACTIVE and
+        stop there. Validation's assignment-resolution query
+        (app.modules.validation.tasks) never checks rules.status at
+        all — only rule_assignments.is_enabled — so a promoted rule with
+        no assignment had, and could only ever have had, zero effect on
+        any real validation run: "promoted" was a status label with no
+        actual behavior behind it. This method now creates the correct
+        rule_assignment (see _resolve_promotion_assignment) in the same
+        transaction as the status flip: both are flushed together and
+        committed together, so a failure creating the assignment (e.g. a
+        genuine duplicate) leaves the rule PENDING_REVIEW rather than
+        landing in the same "ACTIVE but inert" state this fix exists to
+        eliminate — and, just as importantly, success never leaves an
+        assignment pointing at a rule that's still PENDING_REVIEW
+        (validation not checking rules.status means an enabled assignment
+        alone is enough to be evaluated, promoted or not)."""
         rule = self.get_rule(rule_id)
         if rule.status != "PENDING_REVIEW":
             raise InvalidRuleReviewTransitionError(
                 f"Rule {rule_id} is {rule.status!r}, not PENDING_REVIEW — nothing to promote"
             )
 
+        rule_version = self._db.execute(
+            select(RuleVersion).where(RuleVersion.rule_id == rule.id, RuleVersion.is_current.is_(True))
+        ).scalar_one()
+        assignment_scope, column_id, dataset_id = self._resolve_promotion_assignment(rule, rule_version)
+
+        if self._db.get(Dataset, dataset_id) is None:
+            raise DatasetNotFoundError(f"Dataset {dataset_id} not found")
+        if column_id is not None:
+            valid_column = self._db.execute(
+                select(Column.id).where(Column.id == column_id, Column.dataset_id == dataset_id)
+            ).scalar_one_or_none()
+            if valid_column is None:
+                raise InvalidRuleAssignmentScopeError(f"Column {column_id} does not belong to dataset {dataset_id}")
+
         rule.status = "ACTIVE"
         rule.updated_at = datetime.now(timezone.utc)
+
+        assignment = RuleAssignment(
+            rule_version_id=rule_version.id, dataset_id=dataset_id, assignment_scope=assignment_scope,
+            column_id=column_id, cross_column_key=None, template_id=None, is_enabled=True, assigned_by=actor.id,
+        )
+        self._db.add(assignment)
+
+        try:
+            self._db.flush()
+        except IntegrityError as exc:
+            self._db.rollback()
+            raise DuplicateRuleAssignmentError(
+                "An equivalent rule assignment already exists for this dataset/scope/template"
+            ) from exc
 
         self._audit.record(
             actor=actor,
@@ -232,6 +346,13 @@ class RulesService:
             entity_id=rule.id,
             before={"status": "PENDING_REVIEW"},
             after={"status": "ACTIVE"},
+        )
+        self._audit.record(
+            actor=actor,
+            action="rule_assignment.created",
+            entity_type="RULE_ASSIGNMENT",
+            entity_id=assignment.id,
+            after={"dataset_id": str(dataset_id), "assignment_scope": assignment_scope},
         )
         self._db.commit()
         self._db.refresh(rule)

@@ -169,6 +169,11 @@ class InvalidRuleReviewTransitionError(AppError):
     status_code = status.HTTP_409_CONFLICT
 
 
+class RulePromotionNotSupportedError(AppError):
+    code = "RULE_PROMOTION_NOT_SUPPORTED"
+    status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+
+
 class ValidationRunNotFoundError(NotFoundError):
     code = "VALIDATION_RUN_NOT_FOUND"
 
