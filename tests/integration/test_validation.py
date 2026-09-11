@@ -284,6 +284,53 @@ def test_evaluation_timeout_marks_run_and_job_failed(
         db.commit()
 
 
+def test_uncaught_exception_marks_run_and_job_failed_instead_of_a_permanent_zombie(
+    db: Session, redis_client, admin_user: User, pg_connection: Connection, monkeypatch
+) -> None:
+    """Regression test for the incident this catch-all exists for: a
+    provider whose sample_rows() didn't accept a keyword argument every
+    caller passes unconditionally raised an uncaught TypeError, and
+    validation_runs/jobs were left stuck at RUNNING forever with no error
+    recorded anywhere (neither was ever the specific source_adapters error
+    type the task already handled). Simulates that same shape of surprise
+    exception and asserts the run/job are marked FAILED with a real
+    error_message instead of staying RUNNING."""
+    from app.modules.validation import tasks as validation_tasks
+
+    table_name = f"dq_val_uncaught_{uuid.uuid4().hex[:8]}"
+    try:
+        dataset = _make_dataset(
+            db, redis_client, admin_user, pg_connection, table_name,
+            rows_sql=f"INSERT INTO {table_name} VALUES (1,'a',10)",
+        )
+
+        fake_provider = MagicMock()
+        fake_provider.sample_rows.side_effect = TypeError(
+            "sample_rows() got an unexpected keyword argument 'row_count_estimate'"
+        )
+        fake_provider.close.return_value = None
+        monkeypatch.setattr(validation_tasks, "get_provider", lambda *a, **kw: fake_provider)
+
+        validation_run, job = ValidationService(db).start_validation(
+            actor=admin_user, dataset_id=dataset.id, template_id=None
+        )
+        run_validation(str(job.id), str(validation_run.id))
+
+        db.expire_all()
+        completed_run = db.get(ValidationRun, validation_run.id)
+        completed_job = JobsService(db, redis_client).get(job.id)
+
+        assert completed_run.status == "FAILED"
+        assert completed_run.completed_at is not None
+        assert "TypeError" in completed_run.error_message
+        assert "row_count_estimate" in completed_run.error_message
+        assert completed_job.status == "FAILED"
+        assert completed_job.error_message == completed_run.error_message
+    finally:
+        db.execute(text(f"DROP TABLE IF EXISTS {table_name}"))
+        db.commit()
+
+
 def test_cancel_in_progress_validation(
     db: Session, redis_client, admin_user: User, pg_connection: Connection, monkeypatch
 ) -> None:

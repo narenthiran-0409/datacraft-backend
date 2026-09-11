@@ -124,11 +124,20 @@ class SourceDatabaseProvider(ABC):
         raise NotImplementedError("Implemented in a later phase")
 
     @abstractmethod
-    def sample_rows(self, schema: str, table: str, sample_size: int) -> SampleResult:
+    def sample_rows(
+        self, schema: str, table: str, sample_size: int, row_count_estimate: int | None = None
+    ) -> SampleResult:
         """Pulls one bounded sample of up to sample_size rows. No offset —
         each profiling run pulls exactly one sample. SampleResult.is_full_scan
         is True only when every row of the table was returned (sample_size
-        >= the table's actual row count for this call)."""
+        >= the table's actual row count for this call).
+
+        row_count_estimate is an optional hint (datasets.row_count_estimate)
+        a provider MAY use to pick a cheaper/more accurate sampling strategy
+        (PostgreSQLProvider uses it to choose between a plain full-table
+        SELECT, TABLESAMPLE, and LIMIT). Every provider must accept it —
+        callers pass it unconditionally — but a provider without a
+        size-aware strategy may simply ignore it."""
         raise NotImplementedError("Implemented in a later phase")
 
     @abstractmethod

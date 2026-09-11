@@ -98,6 +98,25 @@ def test_sample_rows_returns_rows_as_dicts_with_top_clause() -> None:
     assert param == 20
 
 
+def test_sample_rows_accepts_row_count_estimate_kwarg() -> None:
+    """Regression test: app/modules/validation/tasks.py calls
+    provider.sample_rows(..., row_count_estimate=...) unconditionally for
+    every provider, but this provider's signature previously only accepted
+    (schema, table, sample_size) — the same call from tasks.py would raise
+    TypeError before this provider was ever reached (no connection, no
+    query). This is exactly the bug that left real SQL Server validation
+    runs stuck at RUNNING forever with no error recorded. This provider
+    doesn't use the value (no size-aware sampling strategy implemented),
+    but must accept it without error."""
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider, fetchall_result=[(1, "a")])
+    cur.description = [("id",), ("val",)]
+
+    result = provider.sample_rows("dbo", "orders", sample_size=20, row_count_estimate=5)
+
+    assert result.rows == [{"id": 1, "val": "a"}]
+
+
 def test_sample_rows_quotes_identifiers_containing_brackets() -> None:
     provider = _make_provider()
     cur = _wire_mock_connection(provider, fetchall_result=[])

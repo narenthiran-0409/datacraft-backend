@@ -90,6 +90,23 @@ def test_sample_rows_returns_rows_as_dicts_with_limit_clause() -> None:
     assert params == (20,)
 
 
+def test_sample_rows_accepts_row_count_estimate_kwarg() -> None:
+    """Regression test: app/modules/validation/tasks.py calls
+    provider.sample_rows(..., row_count_estimate=...) unconditionally for
+    every provider, but this provider's signature previously only accepted
+    (schema, table, sample_size) — the same call from tasks.py would raise
+    TypeError before this provider was ever reached (no connection, no
+    query). This provider doesn't use the value (no size-aware sampling
+    strategy implemented), but must accept it without error."""
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider, fetchall_result=[(1, "a")])
+    cur.description = [("ID",), ("VAL",)]
+
+    result = provider.sample_rows("APP", "ORDERS", sample_size=20, row_count_estimate=5)
+
+    assert result.rows == [{"ID": 1, "VAL": "a"}]
+
+
 def test_sample_rows_quotes_identifiers_containing_double_quotes() -> None:
     provider = _make_provider()
     cur = _wire_mock_connection(provider, fetchall_result=[])

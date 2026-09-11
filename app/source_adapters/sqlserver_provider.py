@@ -310,8 +310,14 @@ class SQLServerProvider(SourceDatabaseProvider):
         raise NotImplementedError("Implemented in a later phase")
 
     @with_timeout(settings.PROFILING_QUERY_TIMEOUT_SECONDS)
-    def sample_rows(self, schema: str, table: str, sample_size: int) -> SampleResult:
+    def sample_rows(
+        self, schema: str, table: str, sample_size: int, row_count_estimate: int | None = None
+    ) -> SampleResult:
         # T-SQL has no LIMIT clause — TOP (?) is the parameterized equivalent.
+        # row_count_estimate: accepted (every caller passes it) but unused —
+        # unlike PostgreSQLProvider, this provider has no size-aware sampling
+        # strategy (e.g. TABLESAMPLE) implemented yet; TOP (?) is used as-is
+        # regardless of table size.
         try:
             cur = self._connection().cursor()
             query = f"SELECT TOP (?) * FROM {_quote_ident(schema)}.{_quote_ident(table)}"
