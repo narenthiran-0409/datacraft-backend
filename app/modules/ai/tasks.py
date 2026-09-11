@@ -6,6 +6,7 @@ from app.core.redis_client import get_redis_client
 from app.db.models import User
 from app.modules.ai.suggestion_service import AISuggestionService
 from app.modules.jobs.service import JobsService
+from app.modules.rules.detection_service import RuleDetectionService
 
 # job_type='AI_SUGGESTION' for all four tasks below — the existing
 # idempotency-check-at-task-start pattern (re-fetch job status, exit
@@ -86,5 +87,22 @@ def run_ai_corrections(job_id: str, review_run_id: str) -> dict:
     def work(db, actor):
         suggestions = AISuggestionService(db).generate_corrections(uuid.UUID(review_run_id), actor)
         return {"ai_suggestion_ids": [str(s.id) for s in suggestions], "count": len(suggestions)}
+
+    return _run_ai_job(job_id, work)
+
+
+@celery_app.task(name="ai.run_rule_detection")
+def run_rule_detection(job_id: str, dataset_id: str) -> dict:
+    def work(db, actor):
+        result = RuleDetectionService(db).detect_for_dataset(uuid.UUID(dataset_id), actor)
+        return {
+            "pattern_detected_count": len(result.pattern_detected),
+            "ai_recommended_count": len(result.ai_recommended),
+            "pattern_detected_rule_ids": [str(d.rule.id) for d in result.pattern_detected],
+            "ai_recommended_rule_ids": [str(d.rule.id) for d in result.ai_recommended],
+            "ai_fallback_columns_considered": result.ai_fallback_columns_considered,
+            "ai_fallback_columns_capped": result.ai_fallback_columns_capped,
+            "ai_skipped_reason": result.ai_skipped_reason,
+        }
 
     return _run_ai_job(job_id, work)

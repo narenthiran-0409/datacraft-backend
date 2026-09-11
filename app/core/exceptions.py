@@ -164,6 +164,11 @@ class DuplicateRuleAssignmentError(AppError):
     status_code = status.HTTP_409_CONFLICT
 
 
+class InvalidRuleReviewTransitionError(AppError):
+    code = "INVALID_RULE_REVIEW_TRANSITION"
+    status_code = status.HTTP_409_CONFLICT
+
+
 class ValidationRunNotFoundError(NotFoundError):
     code = "VALIDATION_RUN_NOT_FOUND"
 

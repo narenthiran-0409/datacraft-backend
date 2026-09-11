@@ -84,6 +84,27 @@ def update_rule(
     return RuleResponse.model_validate(rule)
 
 
+@router.post("/rules/{rule_id}/promote", response_model=RuleResponse)
+def promote_rule(
+    rule_id: uuid.UUID,
+    service: RulesService = Depends(get_rules_service),
+    current_user: User = Depends(require_permission("rules.manage")),
+) -> RuleResponse:
+    """The explicit human action that turns a PENDING_REVIEW rule (pattern-
+    detected or AI-recommended) into an ACTIVE one. Nothing else can."""
+    return RuleResponse.model_validate(service.promote_rule(actor=current_user, rule_id=rule_id))
+
+
+@router.post("/rules/{rule_id}/dismiss", response_model=RuleResponse)
+def dismiss_rule(
+    rule_id: uuid.UUID,
+    service: RulesService = Depends(get_rules_service),
+    current_user: User = Depends(require_permission("rules.manage")),
+) -> RuleResponse:
+    """Rejects a PENDING_REVIEW rule (sets it DISABLED, never deleted)."""
+    return RuleResponse.model_validate(service.dismiss_rule(actor=current_user, rule_id=rule_id))
+
+
 @router.post("/rules/{rule_id}/versions", response_model=RuleVersionResponse, status_code=201)
 def publish_rule_version(
     rule_id: uuid.UUID,

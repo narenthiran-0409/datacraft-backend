@@ -76,3 +76,50 @@ def build_review_run_context(*, review_run, issue_summaries: list[dict[str, Any]
         "review_run": {"status": review_run.status},
         "issues": issue_summaries,
     }
+
+
+# The six rule types approved for Phase 5 — duplicated here rather than
+# imported from app.modules.rules.service to keep this module (already
+# imported by every suggestion path) free of a dependency on the rules
+# module. Frozen at Phase 5; if it ever changes, both copies need updating.
+_RULE_TYPES_FOR_PROMPT = ("COMPLETENESS", "UNIQUENESS", "DUPLICATE", "RANGE", "PATTERN", "CROSS_COLUMN")
+
+
+def build_rule_recommendation_context(*, dataset, columns_with_profiles: list[tuple[Any, Any]]) -> dict[str, Any]:
+    """Context for a DATASET-scoped RULE_RECOMMENDATION suggestion covering
+    several columns in one batched call. Statistics only, same "metadata,
+    never row content" boundary as every context builder in this module —
+    deliberately excludes column_profiles.min_value/max_value/mode_value/
+    value_distribution even though they're already computed and stored:
+    those fields hold real, un-redacted values copied from the source
+    data (a literal most-common value, a literal top-10 list), which is
+    row content by this boundary's own definition, not metadata about the
+    column's shape. RuleDetectionService's own pattern-matching half (no
+    LLM, nothing leaves this server) does use those fields — just not
+    this function, which builds what actually gets sent to the provider."""
+    columns = []
+    for column, profile in columns_with_profiles:
+        entry: dict[str, Any] = {
+            "column_name": column.name,
+            "native_data_type": column.native_data_type,
+            "normalized_data_type": column.normalized_data_type,
+            "is_nullable": column.is_nullable,
+        }
+        if profile is not None:
+            entry["null_percentage"] = float(profile.null_percentage) if profile.null_percentage is not None else None
+            entry["distinct_percentage"] = (
+                float(profile.distinct_percentage) if profile.distinct_percentage is not None else None
+            )
+            entry["duplicate_percentage"] = (
+                float(profile.duplicate_percentage) if profile.duplicate_percentage is not None else None
+            )
+            entry["min_length"] = profile.min_length
+            entry["max_length"] = profile.max_length
+            entry["avg_length"] = float(profile.avg_length) if profile.avg_length is not None else None
+        columns.append(entry)
+
+    return {
+        "dataset": {"name": dataset.name, "row_count_estimate": dataset.row_count_estimate},
+        "columns": columns,
+        "supported_rule_types": list(_RULE_TYPES_FOR_PROMPT),
+    }

@@ -5,9 +5,9 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.dependencies import require_permission
-from app.core.exceptions import ReviewRunNotFoundError, ValidationRunNotFoundError
+from app.core.exceptions import DatasetNotFoundError, ReviewRunNotFoundError, ValidationRunNotFoundError
 from app.core.redis_client import get_redis_client
-from app.db.models import ReviewRun, User, ValidationRun
+from app.db.models import Dataset, ReviewRun, User, ValidationRun
 from app.modules.ai.chat_service import AIChatService
 from app.modules.ai.schemas import (
     AISuggestionResponse,
@@ -20,10 +20,17 @@ from app.modules.ai.schemas import (
     CorrectionSuggestionRequest,
     ExplanationRequest,
     PrioritizationRequest,
+    RuleDetectionRequest,
     RunSummaryRequest,
 )
 from app.modules.ai.suggestion_service import AISuggestionService
-from app.modules.ai.tasks import run_ai_cluster, run_ai_corrections, run_ai_prioritization, run_ai_run_summary
+from app.modules.ai.tasks import (
+    run_ai_cluster,
+    run_ai_corrections,
+    run_ai_prioritization,
+    run_ai_run_summary,
+    run_rule_detection,
+)
 from app.modules.jobs.service import JobsService
 
 router = APIRouter(prefix="/ai", tags=["ai"])
@@ -153,6 +160,29 @@ def trigger_corrections(
         created_by=current_user.id,
     )
     run_ai_corrections.delay(str(job.id), str(body.review_run_id))
+    return AISuggestionTriggerResponse(job_id=job.id)
+
+
+@router.post("/suggestions/rule-detection", response_model=AISuggestionTriggerResponse, status_code=202)
+def trigger_rule_detection(
+    body: RuleDetectionRequest,
+    db: Session = Depends(get_db),
+    jobs_service: JobsService = Depends(get_jobs_service),
+    current_user: User = Depends(require_permission("ai.suggest")),
+) -> AISuggestionTriggerResponse:
+    """Whole-dataset candidate-rule detection: a fast pattern-matching pass
+    over every column, falling back to one batched LLM call for whatever
+    it wasn't confident about. Every candidate rule it produces lands as
+    status=PENDING_REVIEW — see POST /rules/{rule_id}/promote (or
+    /dismiss) for the explicit human step that's required before any of
+    them can affect a validation run. Poll GET /jobs/{job_id} for the
+    result summary (counts and rule ids by detection method)."""
+    if db.get(Dataset, body.dataset_id) is None:
+        raise DatasetNotFoundError(f"Dataset {body.dataset_id} not found")
+    job = jobs_service.create(
+        job_type="AI_SUGGESTION", entity_type="DATASET", entity_id=body.dataset_id, created_by=current_user.id,
+    )
+    run_rule_detection.delay(str(job.id), str(body.dataset_id))
     return AISuggestionTriggerResponse(job_id=job.id)
 
 

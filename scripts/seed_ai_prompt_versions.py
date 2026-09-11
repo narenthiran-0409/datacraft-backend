@@ -48,14 +48,18 @@ from app.db.models import AIPromptVersion, User
 #
 # Every template that can produce advisory content shown to a reviewer
 # (ai_chat, ai_explanation, ai_run_summary, ai_prioritization, ai_cluster,
-# ai_correction) explicitly instructs the model that it may only inform or
-# suggest, and must never claim to have approved, finalized, applied, or
-# otherwise made an authoritative decision — this system has no ai.approve
-# permission anywhere (0016_phase12_ai_foundation.py), and approval.decide,
-# staging.create, and publish.execute are the sole authoritative gates. The
-# model output is always written to a PROPOSED-status advisory record
-# (ai_suggestions / correction_suggestions with is_selected=False) that a
-# human with the right permission must separately act on.
+# ai_correction, ai_rule_recommendation) explicitly instructs the model
+# that it may only inform or suggest, and must never claim to have
+# approved, finalized, applied, or otherwise made an authoritative
+# decision — this system has no ai.approve permission anywhere
+# (0016_phase12_ai_foundation.py), and approval.decide, staging.create,
+# and publish.execute are the sole authoritative gates. The model output
+# is always written to a PROPOSED-status advisory record (ai_suggestions
+# / correction_suggestions with is_selected=False) that a human with the
+# right permission must separately act on — for ai_rule_recommendation
+# specifically, RuleDetectionService additionally mirrors each accepted
+# recommendation into a rules row that starts PENDING_REVIEW, not ACTIVE,
+# for the same reason (see app/modules/rules/service.py's create_rule()).
 
 PROMPTS: dict[str, str] = {
     "ai_chat": (
@@ -140,6 +144,33 @@ PROMPTS: dict[str, str] = {
         "human reviewer with the appropriate permission examines it and explicitly selects it "
         "through the platform's correction workflow. Do not phrase your answer as though the "
         "correction has already been made, accepted, or approved."
+    ),
+    "ai_rule_recommendation": (
+        "You recommend candidate data quality rules for a batch of columns in one dataset that a "
+        "fast pattern-matching pass could not confidently categorize on its own. You will receive "
+        "the dataset's name and row count, and for each column: its name, native and normalized "
+        "data type, nullability, and aggregate statistics (null/distinct/duplicate percentage, "
+        "value-length statistics). You will never receive actual data values from the column — no "
+        "sample rows, no min/max/mode values, nothing a reviewer would recognize as real data. Base "
+        "every recommendation strictly on the column name, type, and statistics you were given.\n\n"
+        "You may recommend a rule using ONLY these six rule types: COMPLETENESS, UNIQUENESS, "
+        "DUPLICATE, RANGE, PATTERN, CROSS_COLUMN — the list you receive as supported_rule_types is "
+        "authoritative; never invent another type. Respond with ONLY a JSON array, no prose before "
+        "or after it and no markdown code fence. Each element is an object with exactly these keys: "
+        "column_name (must match one of the columns you were given), rule_type (one of the six "
+        "types), definition (a JSON object matching that rule type's own parameter shape — "
+        "COMPLETENESS: {\"max_null_percentage\": number}, UNIQUENESS: {\"max_duplicate_percentage\": "
+        "number}, RANGE: {\"min\": number, \"max\": number}, PATTERN: {\"regex\": string}, DUPLICATE: "
+        "{}, CROSS_COLUMN: {\"check\": \"all_equal\"}), confidence (a number from 0 to 1, your own "
+        "honest estimate), and reasoning (one short sentence). If a column does not clearly warrant "
+        "any of the six rule types given what you were told, omit it from the array entirely — do "
+        "not fabricate a low-value rule just to have an entry for every column. An empty array is a "
+        "completely valid, honest answer if no column warrants one.\n\n"
+        "Every recommendation you produce is strictly advisory. Nothing you return is ever applied "
+        "or activated automatically — it is recorded as a PENDING_REVIEW rule that has no effect on "
+        "any validation run until a human reviewer with the appropriate permission explicitly "
+        "promotes it through the platform's rule review workflow. Do not phrase reasoning as though "
+        "the rule is already active, approved, or in effect."
     ),
 }
 

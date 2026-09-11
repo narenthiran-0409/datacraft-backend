@@ -1,13 +1,15 @@
+import json
 import uuid
 from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.exceptions import AISuggestionNotFoundError, IssueNotFoundError
+from app.core.exceptions import AIResponseInvalidError, AISuggestionNotFoundError, IssueNotFoundError
 from app.db.models import (
     AISuggestion,
     Column,
+    ColumnProfile,
     CorrectionSuggestion,
     Dataset,
     Issue,
@@ -22,6 +24,7 @@ from app.db.models import (
 from app.modules.ai.context import (
     build_issue_context,
     build_review_run_context,
+    build_rule_recommendation_context,
     build_run_summary_context,
 )
 from app.modules.ai.orchestrator_service import AIOrchestratorService
@@ -31,6 +34,7 @@ _PROMPT_KEY_RUN_SUMMARY = "ai_run_summary"
 _PROMPT_KEY_PRIORITIZATION = "ai_prioritization"
 _PROMPT_KEY_CLUSTER = "ai_cluster"
 _PROMPT_KEY_CORRECTION = "ai_correction"
+_PROMPT_KEY_RULE_RECOMMENDATION = "ai_rule_recommendation"
 
 # correction_suggestions.confidence is NOT NULL (frozen Phase 6 schema) —
 # this simple text-response design doesn't extract a structured confidence
@@ -236,3 +240,60 @@ class AISuggestionService:
             created.append(suggestion)
 
         return created
+
+    # --- RULE_RECOMMENDATION (synchronous fallback, called from RuleDetectionService) --
+
+    def generate_rule_recommendations(
+        self, *, dataset: Dataset, columns_with_profiles: list[tuple[Column, ColumnProfile | None]], actor: User,
+    ) -> tuple[AISuggestion, list[dict]]:
+        """One LLM call, one ai_suggestions row, covering every column
+        passed in — never one call per column (RuleDetectionService is
+        responsible for only passing the columns its pattern-matching half
+        wasn't confident about, and for capping how many go through this
+        path). Returns the created suggestion alongside the parsed
+        recommendations so the caller can decide what to do with them —
+        this method never creates or touches a `rules` row itself; that
+        stays RuleDetectionService's job, going through RulesService.
+        create_rule() so the PENDING_REVIEW guarantee is enforced in
+        exactly one place regardless of which half of the detector
+        produced the candidate."""
+        context = build_rule_recommendation_context(dataset=dataset, columns_with_profiles=columns_with_profiles)
+        result = self._orchestrator.run(prompt_key=_PROMPT_KEY_RULE_RECOMMENDATION, context=context, actor=actor)
+
+        recommendations = _parse_rule_recommendations(result.text)
+
+        suggestion = self._create_suggestion(
+            suggestion_type="RULE_RECOMMENDATION", source_context_type="DATASET", source_context_id=dataset.id,
+            content={"text": result.text, "parsed_count": len(recommendations)},
+            provider=result.provider, model=result.model, prompt_version_id=result.prompt_version.id,
+            conversation_id=None, actor=actor, context_hash=result.context_hash,
+        )
+        self._db.commit()
+        self._db.refresh(suggestion)
+        return suggestion, recommendations
+
+
+def _parse_rule_recommendations(text: str) -> list[dict]:
+    """Defensive parse of the LLM's JSON response — strips a markdown code
+    fence if present (models commonly wrap JSON in ```json ... ``` even
+    when told not to), then requires a JSON array. Returns [] (not an
+    error) for a syntactically valid empty array — "no column here
+    warrants a rule" is a legitimate answer, not a failure. Raises
+    AIResponseInvalidError only when the response can't be interpreted as
+    the requested shape at all, since nothing downstream can safely act
+    on an unparseable proposal — matches this project's existing
+    AIResponseInvalidError semantics (HTTP 502, not swallowed silently)."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned[:4].lower() == "json":
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise AIResponseInvalidError(f"Rule recommendation response was not valid JSON: {exc}") from exc
+    if not isinstance(parsed, list):
+        raise AIResponseInvalidError("Rule recommendation response was not a JSON array")
+    return [item for item in parsed if isinstance(item, dict)]

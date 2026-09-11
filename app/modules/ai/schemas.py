@@ -52,6 +52,10 @@ class CorrectionSuggestionRequest(BaseModel):
     review_run_id: uuid.UUID
 
 
+class RuleDetectionRequest(BaseModel):
+    dataset_id: uuid.UUID
+
+
 class AISuggestionTriggerResponse(BaseModel):
     job_id: uuid.UUID
 

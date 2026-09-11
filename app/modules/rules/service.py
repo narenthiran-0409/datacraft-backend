@@ -9,6 +9,7 @@ from app.core.exceptions import (
     DatasetNotFoundError,
     DuplicateRuleAssignmentError,
     InvalidRuleAssignmentScopeError,
+    InvalidRuleReviewTransitionError,
     RuleAssignmentNotFoundError,
     RuleNotFoundError,
     RuleVersionNotFoundError,
@@ -25,6 +26,14 @@ from app.modules.audit.service import AuditingService
 SUPPORTED_RULE_TYPES = frozenset({"COMPLETENESS", "UNIQUENESS", "DUPLICATE", "RANGE", "PATTERN", "CROSS_COLUMN"})
 
 _ASSIGNMENT_SCOPES = frozenset({"SINGLE_COLUMN", "DATASET_LEVEL", "CROSS_COLUMN"})
+
+# Origins whose output must never become active without an explicit human
+# review — enforced structurally in create_rule() below (every caller,
+# present or future, gets this for free) rather than trusted to each
+# caller to remember. Matches every other AI-adjacent feature in this
+# system's standing rule: model/heuristic output is always PROPOSED,
+# never authoritative, until a human with the right permission acts on it.
+_REVIEW_REQUIRED_ORIGINS = frozenset({"AI_RECOMMENDED", "PATTERN_DETECTED"})
 
 # ASCII Unit Separator — matches the frozen design's record_ref composite-key
 # delimiter choice (Section 2), reused here for the same reason: a
@@ -71,13 +80,23 @@ class RulesService:
                 f"Unsupported rule_type '{rule_type}'. Supported types: {sorted(SUPPORTED_RULE_TYPES)}"
             )
 
+        # Structural guarantee, not a convention any individual caller has
+        # to remember: any rule whose origin is AI_RECOMMENDED or
+        # PATTERN_DETECTED starts PENDING_REVIEW no matter what — a rule
+        # only becomes ACTIVE via promote_rule(), which requires
+        # rules.manage. This is the single choke point every rule
+        # creation path (this API, the pattern detector, the AI fallback)
+        # goes through, so the "nothing automated becomes active" rule
+        # can't be bypassed by a future caller forgetting to set status.
+        initial_status = "PENDING_REVIEW" if origin in _REVIEW_REQUIRED_ORIGINS else "ACTIVE"
+
         rule = Rule(
             name=name,
             description=description,
             category=category,
             rule_type=rule_type,
             origin=origin,
-            status="ACTIVE",
+            status=initial_status,
             created_by=actor.id,
         )
         self._db.add(rule)
@@ -187,6 +206,63 @@ class RulesService:
         self._db.commit()
         self._db.refresh(new_version)
         return new_version
+
+    def promote_rule(self, *, actor: User, rule_id: uuid.UUID) -> Rule:
+        """The only path a PENDING_REVIEW rule (pattern-detected or
+        AI-recommended) can ever take to become ACTIVE — always an
+        explicit human action, never automatic. Requires the rule to
+        currently be PENDING_REVIEW: promoting an already-ACTIVE or
+        DISABLED rule is rejected rather than silently accepted, so this
+        can't be used as a backdoor status-setter for rules outside the
+        review workflow (RuleUpdateRequest/update_rule already covers
+        general status changes for those)."""
+        rule = self.get_rule(rule_id)
+        if rule.status != "PENDING_REVIEW":
+            raise InvalidRuleReviewTransitionError(
+                f"Rule {rule_id} is {rule.status!r}, not PENDING_REVIEW — nothing to promote"
+            )
+
+        rule.status = "ACTIVE"
+        rule.updated_at = datetime.now(timezone.utc)
+
+        self._audit.record(
+            actor=actor,
+            action="rule.promoted",
+            entity_type="RULE",
+            entity_id=rule.id,
+            before={"status": "PENDING_REVIEW"},
+            after={"status": "ACTIVE"},
+        )
+        self._db.commit()
+        self._db.refresh(rule)
+        return rule
+
+    def dismiss_rule(self, *, actor: User, rule_id: uuid.UUID) -> Rule:
+        """Rejects a PENDING_REVIEW rule — sets it DISABLED rather than
+        deleting it, matching this project's standing no-physical-deletes-
+        on-business-critical-entities convention (RuleAssignmentService.
+        soft_disable follows the same pattern). Same PENDING_REVIEW
+        precondition as promote_rule, for the same reason."""
+        rule = self.get_rule(rule_id)
+        if rule.status != "PENDING_REVIEW":
+            raise InvalidRuleReviewTransitionError(
+                f"Rule {rule_id} is {rule.status!r}, not PENDING_REVIEW — nothing to dismiss"
+            )
+
+        rule.status = "DISABLED"
+        rule.updated_at = datetime.now(timezone.utc)
+
+        self._audit.record(
+            actor=actor,
+            action="rule.dismissed",
+            entity_type="RULE",
+            entity_id=rule.id,
+            before={"status": "PENDING_REVIEW"},
+            after={"status": "DISABLED"},
+        )
+        self._db.commit()
+        self._db.refresh(rule)
+        return rule
 
 
 class RuleAssignmentService:
