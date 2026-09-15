@@ -511,3 +511,158 @@ def test_duplicate_celery_delivery_is_idempotent(
         db.execute(select(ColumnProfile).where(ColumnProfile.profile_run_id == profile_run.id)).scalars().all()
     )
     assert second_pass_column_profile_count == first_pass_column_profile_count  # no duplicate rows written
+
+
+def test_provider_not_implementing_exact_stats_still_profiles_correctly_via_sampled_fallback(
+    db: Session, redis_client, admin_user: User, pg_connection: Connection, dup_test_table: str, monkeypatch
+) -> None:
+    """Regression test for the real SQL Server/MySQL/Oracle/SAP HANA
+    incident: those providers' get_dataset_column_stats() unconditionally
+    raise NotImplementedError (per app.source_adapters.base's own
+    documented "PostgreSQL-only live-verification" policy) — before this
+    fix, that propagated uncaught out of run_profile entirely (no outer
+    exception handler existed), leaving the job stuck RUNNING with no
+    error, dependent on the generic stale-job sweep to ever notice.
+
+    Provider-agnostic by design: wraps the real PostgreSQLProvider so this
+    proves the fix for ANY provider that raises NotImplementedError here,
+    not something SQL-Server-specific (which isn't exercised by this test
+    suite at all). Verifies the run reaches COMPLETED AND that every
+    required statistic (null/distinct counts+percentages, min/max,
+    mean/median/stddev, string min/max, date min/max) is numerically
+    correct when derived from the sampled rows — not just "some fallback
+    value populated".
+    """
+    from app.modules.profiling import tasks as profiling_tasks
+
+    _discover(db, redis_client, admin_user, pg_connection)
+    dataset = _get_dataset(db, pg_connection, dup_test_table)
+
+    real_get_provider = profiling_tasks.get_provider
+
+    class NotImplementedStatsWrapper:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def get_dataset_column_stats(self, *args, **kwargs):
+            raise NotImplementedError("Implemented in a later phase")
+
+    monkeypatch.setattr(
+        profiling_tasks, "get_provider", lambda *a, **k: NotImplementedStatsWrapper(real_get_provider(*a, **k))
+    )
+
+    profile_run, job = ProfilingService(db, redis_client).start_profiling(
+        actor=admin_user, dataset_id=dataset.id, sample_size=None, full_scan=True, include_top_values=False
+    )
+    result = run_profile(str(job.id), str(profile_run.id))
+    db.expire_all()
+    profile_run = db.get(ProfileRun, profile_run.id)
+
+    # The key assertion: NOT FAILED, NOT stuck RUNNING. Genuine evaluation
+    # via the sample-derived fallback, not a run that merely avoided crashing.
+    assert result["status"] == "COMPLETED"
+    assert profile_run.status == "COMPLETED"
+    assert profile_run.error_message is None
+
+    def _profile_for(column_name: str) -> ColumnProfile:
+        column = db.execute(
+            select(Column).where(Column.dataset_id == dataset.id, Column.name == column_name)
+        ).scalar_one()
+        return db.execute(
+            select(ColumnProfile).where(
+                ColumnProfile.profile_run_id == profile_run.id, ColumnProfile.column_id == column.id
+            )
+        ).scalar_one()
+
+    # score NUMERIC: 9 non-null (10,10,20,20,30,40,60,70,80), 1 NULL, 7 distinct.
+    score = _profile_for("score")
+    assert score.pattern_summary["exact_stats"] is False  # proves the fallback path, not push-down, was used
+    assert score.null_count == 1
+    assert float(score.null_percentage) == 10.0
+    assert score.distinct_count == 7
+    assert float(score.distinct_percentage) == 70.0
+    assert float(score.min_value) == 10.0
+    assert float(score.max_value) == 80.0
+    assert float(score.mean_value) == pytest.approx(340 / 9, rel=1e-6)
+    assert float(score.median_value) == 30.0
+    assert float(score.sum_value) == 340.0
+    assert score.stddev_value is not None
+    assert score.outlier_count is not None
+
+    # name TEXT: no NULLs, 8 distinct (Alice/Bob each appear twice).
+    name = _profile_for("name")
+    assert name.null_count == 0
+    assert name.distinct_count == 8
+    assert name.min_value == "Alice"
+    assert name.max_value == "Heidi"
+
+    # note TEXT: includes one blank string (distinct from NULL) -> min_value "".
+    note = _profile_for("note")
+    assert note.null_count == 0
+    assert note.min_value == ""
+    assert note.max_value == "y"
+    assert note.pattern_summary["blank_count"] == 1
+
+    # created_on DATE: 1 NULL, 7 distinct dates, real min/max.
+    created_on = _profile_for("created_on")
+    assert created_on.null_count == 1
+    assert float(created_on.null_percentage) == 10.0
+    assert created_on.distinct_count == 7
+    assert created_on.min_value == "2024-01-01"
+    assert created_on.max_value == "2024-08-01"
+
+
+def test_genuine_profiling_failure_reaches_failed_not_stuck_running(
+    db: Session, redis_client, admin_user: User, pg_connection: Connection, dup_test_table: str, monkeypatch
+) -> None:
+    """The other half of the same fix: a genuinely unexpected exception
+    (not one of the anticipated source-adapter exceptions) must still
+    reach a clean FAILED status with an actionable error_message — never
+    silently crash the Celery task and leave the job/profile_run stuck at
+    RUNNING dependent on the generic stale-job sweep, which was possible
+    before run_profile had an outer exception handler."""
+    from app.modules.profiling import tasks as profiling_tasks
+
+    _discover(db, redis_client, admin_user, pg_connection)
+    dataset = _get_dataset(db, pg_connection, dup_test_table)
+
+    real_get_provider = profiling_tasks.get_provider
+
+    class BrokenSampleRowsWrapper:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def sample_rows(self, *args, **kwargs):
+            raise RuntimeError("simulated unexpected provider failure")
+
+    monkeypatch.setattr(
+        profiling_tasks, "get_provider", lambda *a, **k: BrokenSampleRowsWrapper(real_get_provider(*a, **k))
+    )
+
+    profile_run, job = ProfilingService(db, redis_client).start_profiling(
+        actor=admin_user, dataset_id=dataset.id, sample_size=None, full_scan=True, include_top_values=False
+    )
+    result = run_profile(str(job.id), str(profile_run.id))
+    db.expire_all()
+    profile_run = db.get(ProfileRun, profile_run.id)
+    job = db.get(Job, job.id)
+
+    assert result["status"] == "FAILED"
+    assert "simulated unexpected provider failure" in result["error"]
+    assert profile_run.status == "FAILED"
+    assert profile_run.error_message
+    assert "simulated unexpected provider failure" in profile_run.error_message
+    assert job.status == "FAILED"
+
+    # No ColumnProfile rows were written — the run failed before profiling
+    # any column, and nothing was left half-written.
+    column_profiles = db.execute(
+        select(ColumnProfile).where(ColumnProfile.profile_run_id == profile_run.id)
+    ).scalars().all()
+    assert len(column_profiles) == 0

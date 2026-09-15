@@ -31,6 +31,7 @@ from app.modules.discovery import tasks as _discovery_tasks  # noqa: E402,F401
 from app.modules.jobs import tasks as _jobs_tasks  # noqa: E402,F401
 from app.modules.profiling import tasks as _profiling_tasks  # noqa: E402,F401
 from app.modules.publishing import tasks as _publishing_tasks  # noqa: E402,F401
+from app.modules.staging import tasks as _staging_tasks  # noqa: E402,F401
 from app.modules.validation import tasks as _validation_tasks  # noqa: E402,F401
 
 celery_app.conf.beat_schedule = {

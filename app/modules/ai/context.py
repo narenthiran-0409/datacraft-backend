@@ -1,14 +1,25 @@
 """Context assembly + deterministic input-context hashing.
 
-Input boundary (locked Phase 12 decision): allowed context is metadata
-only — validation rule definitions/metadata, validation failure metadata,
-column metadata, profiling statistics, dataset metadata, review issue
-metadata, correction context, aggregated quality statistics. Never sent
-to the provider: full raw database rows, passwords, credentials,
-connection strings, API keys, secrets. The functions below only ever
-read from metadata-shaped columns (name, type, statistics, counts) —
-never row_snapshot, failed_value, original_value, final_value,
-corrected_fields, or credential_ref.
+Input boundary (Phase 12 decision, narrowed for CORRECTION suggestions —
+see below): allowed context is metadata only — validation rule
+definitions/metadata, validation failure metadata, column metadata,
+profiling statistics, dataset metadata, review issue metadata, correction
+context, aggregated quality statistics. Never sent to the provider: full
+raw database rows, row_snapshot, passwords, credentials, connection
+strings, API keys, secrets, or other columns' values.
+
+build_issue_context() (EXPLANATION) keeps the original, narrower boundary
+exactly as before. build_correction_context() (CORRECTION) deliberately
+includes the single failing cell's own failed_value/expected_value and
+aggregate profiling statistics (null/distinct/duplicate percentage,
+mode/median/mean where present) — a product decision, not an oversight:
+a correction proposal is structurally unable to reason about "what should
+this value actually be" from severity/reason metadata alone, and
+failed_value is already shown to any reviewer in the existing Review UI
+(ValidationFailureResponse.failed_value), so this isn't new exposure of
+data a reviewer couldn't already see. Still never sent: row_snapshot,
+other columns' values, full value_distribution/top-values lists, or
+anything credential-shaped.
 """
 import hashlib
 import json
@@ -49,6 +60,94 @@ def build_issue_context(*, issue, column, validation_failure, rule, rule_version
             "reason": validation_failure.reason,
         },
     }
+
+
+def _profile_summary(column_profile) -> dict[str, Any] | None:
+    """Aggregate statistics only — never value_distribution (a real top-N
+    values list) or min_value/max_value as raw strings beyond what a
+    correction genuinely needs (min/max ARE included here, unlike the
+    rule-recommendation context, because a RANGE/COMPLETENESS correction
+    can directly use them as candidate values, and they're already visible
+    to any reviewer via the dataset's own profiling view)."""
+    if column_profile is None:
+        return None
+    return {
+        "null_percentage": float(column_profile.null_percentage) if column_profile.null_percentage is not None else None,
+        "distinct_percentage": (
+            float(column_profile.distinct_percentage) if column_profile.distinct_percentage is not None else None
+        ),
+        "duplicate_percentage": (
+            float(column_profile.duplicate_percentage) if column_profile.duplicate_percentage is not None else None
+        ),
+        "mode_value": column_profile.mode_value,
+        "median_value": str(column_profile.median_value) if column_profile.median_value is not None else None,
+        "mean_value": str(column_profile.mean_value) if column_profile.mean_value is not None else None,
+        "stddev_value": str(column_profile.stddev_value) if column_profile.stddev_value is not None else None,
+        "min_value": column_profile.min_value,
+        "max_value": column_profile.max_value,
+    }
+
+
+def build_correction_context(
+    *, issue, column, validation_failure, rule, rule_version, column_profile, duplicate_examples: list[dict[str, Any]],
+    relationship_evidence: dict[str, Any] | None = None, advanced_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Context for a CORRECTION suggestion — the enriched boundary described
+    in this module's docstring. duplicate_examples is only ever populated
+    for UNIQUENESS/DUPLICATE rule types: other rows' record_ref/row_index
+    that share this exact failed_value in the same validation run (never
+    their other column values) — enough for the model to say "rows X and Y
+    share this value, review which is authoritative" without inventing a
+    replacement and without exposing full row content.
+
+    relationship_evidence (Phase 1, additive, optional — omitted entirely
+    when None so every pre-existing caller's output is byte-for-byte
+    unchanged): an aggregate summary produced by
+    AISuggestionService._gather_relationship_evidence(), itself backed by
+    app.modules.ai.evidence.discover_relationship_evidence(). Contains only
+    statistics (group size, fit quality, a candidate value already computed
+    deterministically in Python) — never raw comparable rows or any other
+    column's actual values beyond what's already aggregated. The LLM may
+    only adopt or decline this candidate, never compute its own.
+
+    advanced_evidence (Phase 4.5, additive, optional, mutually exclusive
+    with relationship_evidence in practice — AISuggestionService only ever
+    populates one or the other per issue, depending on
+    settings.AI_CORRECTION_ADVANCED_INFERENCE_ENABLED): the aggregate
+    output of app.modules.ai.candidates.aggregate_candidates() over
+    whichever of the four Phase 4 evidence engines (relationship, sequence,
+    template, temporal) were applicable to this issue's column/rule_type.
+    Same privacy boundary as relationship_evidence — aggregate statistics
+    and a single recommended candidate value only, never raw comparable
+    rows/pairs or any other column's actual values."""
+    context: dict[str, Any] = {
+        "issue": {
+            "severity": issue.severity,
+            "status": issue.status,
+            "column_name": column.name if column is not None else None,
+            "normalized_data_type": column.normalized_data_type if column is not None else None,
+        },
+        "rule": {
+            "rule_type": rule.rule_type,
+            "category": rule.category,
+            "definition": rule_version.definition,
+            "severity": rule_version.severity,
+            "origin": rule.origin,
+        },
+        "validation_failure": {
+            "severity": validation_failure.severity,
+            "reason": validation_failure.reason,
+            "failed_value": validation_failure.failed_value,
+            "expected_value": validation_failure.expected_value,
+        },
+        "column_profile": _profile_summary(column_profile),
+        "duplicate_examples": duplicate_examples,
+    }
+    if relationship_evidence is not None:
+        context["relationship_evidence"] = relationship_evidence
+    if advanced_evidence is not None:
+        context["advanced_evidence"] = advanced_evidence
+    return context
 
 
 def build_run_summary_context(*, validation_run, dataset, failure_counts_by_severity: dict[str, int]) -> dict[str, Any]:

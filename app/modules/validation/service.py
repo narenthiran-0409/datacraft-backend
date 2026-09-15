@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import Text, cast, func, select
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import (
@@ -19,6 +19,7 @@ from app.db.models import (
     RuleVersion,
     User,
     ValidationFailure,
+    ValidationMetric,
     ValidationResult,
     ValidationRun,
 )
@@ -95,6 +96,7 @@ class ValidationService:
                 Rule.id,
                 Rule.name,
                 Rule.rule_type,
+                Rule.origin,
                 RuleAssignment.assignment_scope,
                 Column.name,
             )
@@ -119,6 +121,7 @@ class ValidationService:
                 "rule_id": rule_id,
                 "rule_name": rule_name,
                 "rule_type": rule_type,
+                "rule_origin": rule_origin,
                 "assignment_scope": assignment_scope,
                 "column_id": failure.column_id,
                 "column_name": column_name,
@@ -128,9 +131,58 @@ class ValidationService:
                 "reason": failure.reason,
                 "created_at": failure.created_at,
             }
-            for failure, record_ref, row_index, rule_id, rule_name, rule_type, assignment_scope, column_name in rows
+            for failure, record_ref, row_index, rule_id, rule_name, rule_type, rule_origin, assignment_scope, column_name in rows
         ]
         return items, total
+
+    def list_evaluated_rules(self, *, validation_run_id: uuid.UUID) -> list[dict]:
+        """The set of RuleAssignments actually resolved and evaluated for a
+        run, regardless of whether they produced any failures — sourced
+        from the `rule_evaluated` ValidationMetric rows the worker writes
+        per assignment at evaluation time. This is what proves
+        rules_evaluated_count > 0 corresponds to real rules, with names/
+        columns/origin a data steward can recognize (not bare IDs)."""
+        self.get_validation_run(validation_run_id)  # 404 if the run itself doesn't exist
+
+        stmt = (
+            select(
+                RuleAssignment.id,
+                Rule.id,
+                Rule.name,
+                Rule.rule_type,
+                Rule.origin,
+                RuleAssignment.assignment_scope,
+                RuleAssignment.column_id,
+                Column.name,
+                RuleVersion.severity,
+            )
+            .select_from(ValidationMetric)
+            .join(RuleAssignment, cast(RuleAssignment.id, Text) == ValidationMetric.metric_group)
+            .join(RuleVersion, RuleVersion.id == RuleAssignment.rule_version_id)
+            .join(Rule, Rule.id == RuleVersion.rule_id)
+            .outerjoin(Column, Column.id == RuleAssignment.column_id)
+            .where(
+                ValidationMetric.validation_run_id == validation_run_id,
+                ValidationMetric.metric_name == "rule_evaluated",
+            )
+            .order_by(Rule.name)
+        )
+        rows = self._db.execute(stmt).all()
+        items = [
+            {
+                "rule_assignment_id": assignment_id,
+                "rule_id": rule_id,
+                "rule_name": rule_name,
+                "rule_type": rule_type,
+                "rule_origin": rule_origin,
+                "assignment_scope": assignment_scope,
+                "column_id": column_id,
+                "column_name": column_name,
+                "severity": severity,
+            }
+            for assignment_id, rule_id, rule_name, rule_type, rule_origin, assignment_scope, column_id, column_name, severity in rows
+        ]
+        return items
 
     def _get_active_dataset(self, dataset_id: uuid.UUID) -> Dataset:
         dataset = self._db.get(Dataset, dataset_id)

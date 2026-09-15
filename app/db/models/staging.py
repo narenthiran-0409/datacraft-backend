@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, Integer, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, ForeignKey, Integer, SmallInteger, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -34,6 +34,28 @@ class StagingRun(UUIDPKMixin, Base):
     completed_at: Mapped[datetime | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(nullable=False, server_default=func.now())
     updated_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+    # Phase 4.12 — materialized staging dataset. All nullable/zero-default so
+    # every historical (pre-4.12) row reads back as "not materialized"
+    # rather than crashing: destination_table IS NULL is the single
+    # authoritative "legacy/not-yet-materialized" signal the API contract
+    # uses (see StagingRunNotMaterializedError), deliberately not a separate
+    # boolean flag that could drift out of sync with it.
+    #
+    # `status` above is UNCHANGED in meaning — it still reflects only the
+    # affected-record audit-layer build (StagingRecord rows), exactly as
+    # before this phase. Materialization progress lives entirely in
+    # materialization_phase/progress_percentage below, an orthogonal
+    # dimension, so publishing's `staging_run.status == "READY"` eligibility
+    # check and the existing_building-conflict check are both unaffected.
+    destination_schema: Mapped[str | None] = mapped_column(Text, nullable=True)
+    destination_table: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    materialized_row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    copied_row_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    materialization_phase: Mapped[str | None] = mapped_column(Text, nullable=True)
+    progress_percentage: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    materialization_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class StagingRecord(UUIDPKMixin, Base):

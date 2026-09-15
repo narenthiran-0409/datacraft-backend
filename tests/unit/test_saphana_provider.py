@@ -118,6 +118,17 @@ def test_sample_rows_quotes_identifiers_containing_double_quotes() -> None:
     assert '"weird""schema"."weird""table"' in executed_sql
 
 
+def test_fetch_rows_by_keys_raises_not_implemented() -> None:
+    """Phase 3 audit: SAP HANA has no real targeted-row-retrieval
+    implementation yet — must raise NotImplementedError explicitly, never
+    silently fall back to a full-table scan or fake support."""
+    import pytest
+
+    provider = _make_provider()
+    with pytest.raises(NotImplementedError):
+        provider.fetch_rows_by_keys("APP", "ORDERS", [{"ID": 1}])
+
+
 def test_sample_rows_wraps_driver_error() -> None:
     from hdbcli import dbapi
     import pytest
@@ -130,3 +141,80 @@ def test_sample_rows_wraps_driver_error() -> None:
 
     with pytest.raises(SourceQueryError):
         provider.sample_rows("APP", "ORDERS", sample_size=20)
+
+
+def test_count_rows_issues_count_star() -> None:
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider, fetchone_result=(13,))
+
+    assert provider.count_rows("APP", "ORDERS") == 13
+    assert "COUNT(*)" in cur.execute.call_args[0][0]
+
+
+def test_count_rows_wraps_driver_error() -> None:
+    import pytest
+    from hdbcli import dbapi
+
+    from app.source_adapters.exceptions import SourceQueryError
+
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider)
+    cur.execute.side_effect = dbapi.Error("boom")
+
+    with pytest.raises(SourceQueryError):
+        provider.count_rows("APP", "ORDERS")
+
+
+def test_iter_rows_yields_bounded_batches_using_limit_offset() -> None:
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider)
+    cur.description = [("ID",), ("NAME",)]
+    cur.fetchall.side_effect = [[(1, "a"), (2, "b")], [(3, "c")]]
+
+    batches = list(provider.iter_rows("APP", "ORDERS", ["ID", "NAME"], batch_size=2, order_by=["ID"]))
+
+    assert batches == [
+        [{"ID": 1, "NAME": "a"}, {"ID": 2, "NAME": "b"}],
+        [{"ID": 3, "NAME": "c"}],
+    ]
+    assert cur.execute.call_count == 2
+    first_call = cur.execute.call_args_list[0]
+    assert "LIMIT ? OFFSET ?" in first_call[0][0]
+    assert first_call[0][1] == (2, 0)
+    second_call = cur.execute.call_args_list[1]
+    assert second_call[0][1] == (2, 2)
+
+
+def test_iter_rows_empty_table_yields_no_batches() -> None:
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider)
+    cur.description = [("ID",)]
+    cur.fetchall.side_effect = [[]]
+
+    assert list(provider.iter_rows("APP", "ORDERS", ["ID"], batch_size=100)) == []
+
+
+def test_iter_rows_falls_back_to_selected_columns_when_no_order_by() -> None:
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider)
+    cur.description = [("A",), ("B",)]
+    cur.fetchall.side_effect = [[]]
+
+    list(provider.iter_rows("APP", "ORDERS", ["A", "B"], batch_size=10, order_by=None))
+
+    executed_sql = cur.execute.call_args_list[0][0][0]
+    assert '"A"' in executed_sql and '"B"' in executed_sql
+
+
+def test_iter_rows_wraps_driver_error() -> None:
+    import pytest
+    from hdbcli import dbapi
+
+    from app.source_adapters.exceptions import SourceQueryError
+
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider)
+    cur.execute.side_effect = dbapi.Error("boom")
+
+    with pytest.raises(SourceQueryError):
+        list(provider.iter_rows("APP", "ORDERS", ["ID"], batch_size=10))

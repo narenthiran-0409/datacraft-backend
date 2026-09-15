@@ -129,14 +129,35 @@ def build_row_snapshot(fetched_row: dict[str, Any] | None, corrected_fields: lis
 
 def build_corrected_fields(items: list[ScopeItem], column_name_by_id: dict) -> list[dict]:
     """Raises StagingIntegrityViolationError if any item has no valid
-    correction — never silently skips an integrity violation."""
+    correction — never silently skips an integrity violation.
+
+    Phase 4.8: also raises StagingIntegrityViolationError if two items in
+    the SAME group (i.e. targeting the same record_ref — nothing here
+    depends on that; it is simply true of every call site) name the same
+    column with DIFFERING final_value. Nothing in the rule-assignment
+    model prevents two different enabled rules from both targeting one
+    column and both failing on the same row (e.g. a COMPLETENESS rule and
+    a PATTERN rule both assigned to `email`) — build_row_snapshot's
+    last-one-wins overlay would otherwise silently pick whichever
+    corrected_fields entry happens to come last, discarding the other
+    decision without a trace. Two items agreeing on the identical value
+    are not a conflict and are still allowed (harmless double-coverage)."""
     fields = []
+    final_value_by_column: dict[str, str] = {}
     for item in items:
         if item.correction_final_value is None:
             raise StagingIntegrityViolationError(
                 f"Issue {item.issue_id} has no corresponding corrections row with a non-null final_value"
             )
         column_name = column_name_by_id.get(item.column_id)
+        if column_name is not None:
+            existing_value = final_value_by_column.get(column_name)
+            if existing_value is not None and existing_value != item.correction_final_value:
+                raise StagingIntegrityViolationError(
+                    f"Conflicting corrections for column '{column_name}': "
+                    f"{existing_value!r} vs {item.correction_final_value!r} (issue {item.issue_id})"
+                )
+            final_value_by_column[column_name] = item.correction_final_value
         fields.append(
             {
                 "column_name": column_name,

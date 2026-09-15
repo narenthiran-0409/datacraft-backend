@@ -263,6 +263,10 @@ class StagingRunNotFoundError(NotFoundError):
     code = "STAGING_RUN_NOT_FOUND"
 
 
+class StagingRecordNotFoundError(NotFoundError):
+    code = "STAGING_RECORD_NOT_FOUND"
+
+
 class StagingRecordCountExceedsLimitError(AppError):
     code = "STAGING_RECORD_COUNT_EXCEEDS_LIMIT"
     status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
@@ -353,6 +357,19 @@ class PreviewSourceUnavailableError(AppError):
 
     code = "PREVIEW_SOURCE_UNAVAILABLE"
     status_code = status.HTTP_502_BAD_GATEWAY
+
+
+class StagingRunNotMaterializedError(AppError):
+    """Phase 4.12 — raised by the destination-metadata/materialized-preview
+    endpoints for a staging run that has no physical staging_data table:
+    either a pre-4.12 historical run (destination_table was never a
+    concept), or a run whose materialization job hasn't reached the
+    table-creation phase yet. Distinct from StagingRunNotFoundError (the
+    run genuinely exists) — this is "exists, but nothing to preview yet."
+    """
+
+    code = "STAGING_RUN_NOT_MATERIALIZED"
+    status_code = status.HTTP_409_CONFLICT
 
 
 class PreviewTimeoutError(AppError):

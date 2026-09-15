@@ -88,3 +88,49 @@ class DatasetPreviewResponse(BaseModel):
     row_count: int
     requested_row_count: int
     capped_to_max: bool = False
+
+
+class BusinessKeyRejectedColumnResponse(BaseModel):
+    name: str
+    normalized_data_type: str
+    reason: str
+
+
+class BusinessKeyCandidateResponse(BaseModel):
+    columns: list[str]
+    width: int
+    status: str
+    reason: str | None
+    total_rows_evaluated: int
+    null_key_rows: int
+    distinct_key_count: int
+    duplicate_key_groups: int
+    verification_level: str | None
+
+
+class BusinessKeyDiscoveryResponse(BaseModel):
+    """Phase 4.6 — DETECTION ONLY. Never implies adoption: adoption is a
+    separate explicit call to POST /datasets/{dataset_id}/business-key/confirm.
+    `already_has_reliable_key=True` means discovery did not even run —
+    an existing source PK or already-declared key is always preferred."""
+
+    dataset_id: uuid.UUID
+    existing_key_strategy: str
+    already_has_reliable_key: bool
+    status: str | None
+    recommended: BusinessKeyCandidateResponse | None
+    candidates: list[BusinessKeyCandidateResponse]
+    rejected_columns: list[BusinessKeyRejectedColumnResponse]
+    widths_searched: list[int]
+    total_rows_evaluated: int | None
+    is_full_scan: bool | None
+    reason: str | None
+
+
+class BusinessKeyConfirmRequest(BaseModel):
+    """Columns the caller believes are currently the verified candidate —
+    echoed back from a prior discover() call. Confirmation always
+    reverifies live and rejects if this no longer matches what a fresh
+    check finds, so this can never silently adopt stale evidence."""
+
+    columns: list[str]

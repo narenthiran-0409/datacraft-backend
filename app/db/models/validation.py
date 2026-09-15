@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, ForeignKey, Integer, Numeric, Text, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, ForeignKey, Integer, Numeric, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -25,6 +25,13 @@ class ValidationRun(UUIDPKMixin, Base):
     warning_rows: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
     failed_rows: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
     quality_score: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), nullable=True)
+    # Number of enabled RuleAssignments the worker actually resolved and
+    # evaluated for this run (not the count of Rule/active-rule rows).
+    # no_applicable_rules is a derived convenience flag: True whenever
+    # rules_evaluated_count == 0, so a trivially-empty evaluation can never
+    # be represented the same way on the wire as a genuine all-pass run.
+    rules_evaluated_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    no_applicable_rules: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     triggered_by: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id"), nullable=True

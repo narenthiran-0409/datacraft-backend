@@ -4,6 +4,10 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.api.v1.datasets.schemas import (
+    BusinessKeyCandidateResponse,
+    BusinessKeyConfirmRequest,
+    BusinessKeyDiscoveryResponse,
+    BusinessKeyRejectedColumnResponse,
     ColumnResponse,
     DatasetListResponse,
     DatasetPatchRequest,
@@ -18,6 +22,7 @@ from app.core.dependencies import require_permission
 from app.core.redis_client import get_redis_client
 from app.db.models import User
 from app.modules.connections.credential_vault import CredentialVaultClient, LocalRedisVaultClient
+from app.modules.datasets.business_key_service import BusinessKeyService
 from app.modules.datasets.key_service import DatasetKeyService
 from app.modules.datasets.preview_service import PREVIEW_DEFAULT_ROWS, PreviewService
 from app.modules.datasets.service import DatasetService
@@ -39,6 +44,10 @@ def get_vault_client() -> CredentialVaultClient:
 
 def get_preview_service(db: Session = Depends(get_db)) -> PreviewService:
     return PreviewService(db, get_vault_client(), get_redis_client())
+
+
+def get_business_key_service(db: Session = Depends(get_db)) -> BusinessKeyService:
+    return BusinessKeyService(db, get_vault_client(), get_redis_client())
 
 
 @router.get("/schemas", response_model=list[SchemaResponse])
@@ -116,6 +125,57 @@ def set_dataset_key_columns(
         dataset_id=dataset_id,
         key_columns=[kc.model_dump() for kc in payload.columns],
     )
+    return DatasetResponse.model_validate(dataset)
+
+
+def _serialize_candidate(evidence) -> BusinessKeyCandidateResponse:
+    return BusinessKeyCandidateResponse(
+        columns=list(evidence.columns), width=evidence.width, status=evidence.status, reason=evidence.reason,
+        total_rows_evaluated=evidence.total_rows_evaluated, null_key_rows=evidence.null_key_rows,
+        distinct_key_count=evidence.distinct_key_count, duplicate_key_groups=evidence.duplicate_key_groups,
+        verification_level=evidence.verification_level,
+    )
+
+
+@router.get("/datasets/{dataset_id}/business-key/candidates", response_model=BusinessKeyDiscoveryResponse)
+def discover_business_key_candidates_route(
+    dataset_id: uuid.UUID,
+    service: BusinessKeyService = Depends(get_business_key_service),
+    current_user: User = Depends(require_permission("metadata.read")),
+) -> BusinessKeyDiscoveryResponse:
+    """Phase 4.6 — DETECTION ONLY. Never mutates dataset_key_columns or
+    datasets.key_strategy. See BusinessKeyService.discover for the exact
+    read-only guarantee."""
+    report = service.discover(actor=current_user, dataset_id=dataset_id)
+    result = report.result
+    return BusinessKeyDiscoveryResponse(
+        dataset_id=report.dataset_id,
+        existing_key_strategy=report.existing_key_strategy,
+        already_has_reliable_key=report.already_has_reliable_key,
+        status=result.status if result else None,
+        recommended=_serialize_candidate(result.recommended) if result and result.recommended else None,
+        candidates=[_serialize_candidate(c) for c in result.candidates] if result else [],
+        rejected_columns=[
+            BusinessKeyRejectedColumnResponse(name=rc.name, normalized_data_type=rc.normalized_data_type, reason=rc.reason)
+            for rc in (result.rejected_columns if result else [])
+        ],
+        widths_searched=list(result.widths_searched) if result else [],
+        total_rows_evaluated=result.total_rows_evaluated if result else None,
+        is_full_scan=result.is_full_scan if result else None,
+        reason=result.reason if result else None,
+    )
+
+
+@router.post("/datasets/{dataset_id}/business-key/confirm", response_model=DatasetResponse)
+def confirm_business_key_route(
+    dataset_id: uuid.UUID,
+    payload: BusinessKeyConfirmRequest,
+    service: BusinessKeyService = Depends(get_business_key_service),
+    current_user: User = Depends(require_permission("metadata.manage")),
+) -> DatasetResponse:
+    """Phase 4.6 — the only path that may adopt a business-key candidate.
+    Always reverifies live before adopting — see BusinessKeyService.confirm."""
+    dataset = service.confirm(actor=current_user, dataset_id=dataset_id, columns=payload.columns)
     return DatasetResponse.model_validate(dataset)
 
 

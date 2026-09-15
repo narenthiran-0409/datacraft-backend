@@ -101,6 +101,31 @@ def test_build_corrected_fields_raises_on_missing_correction() -> None:
         build_corrected_fields(items, {COL_X: "col_x"})
 
 
+def test_build_corrected_fields_raises_on_conflicting_same_column_values() -> None:
+    """Phase 4.8: two different Issues (e.g. from two different enabled
+    rules both assigned to the same column) targeting the SAME record_ref
+    + column with DIFFERING final_value must never be silently resolved
+    by last-one-wins overlay order — must be a hard integrity error."""
+    items = [
+        ScopeItem(issue_id=ISSUE_A, column_id=COL_X, original_value="old", correction_final_value="value-one"),
+        ScopeItem(issue_id=ISSUE_B, column_id=COL_X, original_value="old", correction_final_value="value-two"),
+    ]
+    with pytest.raises(StagingIntegrityViolationError):
+        build_corrected_fields(items, {COL_X: "col_x"})
+
+
+def test_build_corrected_fields_allows_agreeing_same_column_values() -> None:
+    """Two issues on the same column agreeing on the identical final_value
+    is not a conflict — harmless double-coverage, not an error."""
+    items = [
+        ScopeItem(issue_id=ISSUE_A, column_id=COL_X, original_value="old", correction_final_value="same-value"),
+        ScopeItem(issue_id=ISSUE_B, column_id=COL_X, original_value="old", correction_final_value="same-value"),
+    ]
+    fields = build_corrected_fields(items, {COL_X: "col_x"})
+    assert len(fields) == 2
+    assert all(f["final_value"] == "same-value" for f in fields)
+
+
 # --- build_row_snapshot -----------------------------------------------------
 
 def test_row_snapshot_overlays_corrected_fields_on_fetched_row() -> None:

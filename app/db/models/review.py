@@ -3,7 +3,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import BigInteger, ForeignKey, Text, UniqueConstraint, func
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -69,6 +69,11 @@ class CorrectionSuggestion(UUIDPKMixin, Base):
     )
     suggested_value: Mapped[str] = mapped_column(Text, nullable=False)
     confidence: Mapped[Decimal] = mapped_column(nullable=False)
+    # DETERMINISTIC (rule-based generators) / AI_HIGH_CONFIDENCE / NEEDS_REVIEW
+    # (AI has partial signal but won't guess) / CANNOT_INFER (no usable signal,
+    # or the AI call itself failed). NEEDS_REVIEW and CANNOT_INFER always pair
+    # with suggested_value="" — never a fabricated value.
+    category: Mapped[str] = mapped_column(Text, nullable=False)
     fix_type: Mapped[str] = mapped_column(Text, nullable=False)
     reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_selected: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
@@ -77,6 +82,12 @@ class CorrectionSuggestion(UUIDPKMixin, Base):
     )
     selected_at: Mapped[datetime | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(nullable=False, server_default=func.now())
+    # Phase 4.1 foundation (migration 0024_correction_evidence_cols) — both
+    # nullable, both unused by any application code yet. See
+    # app/modules/ai/candidates.py and that migration's docstring for the
+    # intended shape once a later Phase 4 sub-phase wires them up.
+    strategy: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
 class Correction(UUIDPKMixin, Base):

@@ -72,14 +72,32 @@ class Settings(BaseSettings):
     # full-dataset operation.
     VALIDATION_DATASET_TIMEOUT_SECONDS: int = 300
 
-    # Staging is fully synchronous (no Celery task) — this ceiling is what
-    # keeps a single HTTP request bounded. Exceeding it is rejected with 422
-    # before any staging_runs row is created, never silently truncated.
+    # The affected-record audit-layer build (StagingService._build_records,
+    # producing staging_records rows) is still fully synchronous within the
+    # HTTP request — this ceiling is what keeps that request bounded.
+    # Exceeding it is rejected with 422 before any staging_runs row is
+    # created, never silently truncated. Phase 4.12's full-dataset physical
+    # materialization is a SEPARATE, always-async step (Celery job) that
+    # this setting does not bound — its cost scales with total source row
+    # count, not the number of approved corrections.
     MAX_SYNCHRONOUS_STAGING_RECORDS: int = 50000
     # Bounded timeout for the batched fetch_rows_by_keys() call. Gets its
     # own setting rather than reusing PROFILING_QUERY_TIMEOUT_SECONDS, which
     # is documented as being for ordinary profiling calls specifically.
     STAGING_QUERY_TIMEOUT_SECONDS: int = 30
+
+    # Phase 4.12 — materialized staging dataset. Bounds how many source rows
+    # are held in memory at once by provider.iter_rows() during a full-table
+    # copy into staging_data.<table> — the whole point of the batched/
+    # streaming read contract (never provider.sample_rows(), never a full
+    # in-memory materialization of the source table). Deliberately its own
+    # setting rather than reusing any existing sample-size constant, since
+    # this bounds a single INSERT batch's memory footprint, not a sample.
+    STAGING_MATERIALIZATION_BATCH_SIZE: int = 2000
+    # Bounded timeout for a single provider.count_rows() / iter_rows() batch
+    # query against the source, mirroring STAGING_QUERY_TIMEOUT_SECONDS' role
+    # for fetch_rows_by_keys().
+    STAGING_MATERIALIZATION_QUERY_TIMEOUT_SECONDS: int = 60
 
     # The one directory FILE_EXPORT publishing is permitted to write into.
     # target_reference is resolved relative to this root and validated to
@@ -98,6 +116,39 @@ class Settings(BaseSettings):
     AI_MAX_CONTEXT_TOKENS: int = 8000
     AI_RETRY_MAX_ATTEMPTS: int = 2
     ANTHROPIC_API_KEY: str | None = None
+
+    # Adaptive correction evidence (Phase 1 — app.modules.ai.evidence wired
+    # into AISuggestionService.generate_corrections). Defaults OFF: when
+    # False, no live source query is ever attempted and correction behavior
+    # is unchanged from before this feature existed. The failing row is
+    # located via a targeted provider.fetch_rows_by_keys() lookup (Phase 3);
+    # comparable rows still come from one bounded provider.sample_rows()
+    # call, deliberately never a full-table scan. See
+    # AISuggestionService._gather_relationship_evidence's docstring.
+    AI_CORRECTION_EVIDENCE_ENABLED: bool = False
+    AI_CORRECTION_COMPARABLE_SAMPLE_SIZE: int = 2000
+    AI_CORRECTION_MIN_COMPARABLE_GROUP_SIZE: int = 3
+    AI_CORRECTION_MIN_FIT_QUALITY: float = 0.9
+
+    # Phase 4.1 foundation only: reserved for the advanced multi-strategy
+    # candidate-generation work (sequence/gap, string/template,
+    # date-progression evidence, candidate aggregation/ranking — see
+    # app/modules/ai/candidates.py). Nothing reads this setting yet; no
+    # code path is gated on it until a later Phase 4 sub-phase wires one
+    # up. Defaults False, same safe-by-default posture as
+    # AI_CORRECTION_EVIDENCE_ENABLED.
+    AI_CORRECTION_ADVANCED_INFERENCE_ENABLED: bool = False
+
+    # Phase 4.6 — business-key candidate discovery. One bounded
+    # provider.sample_rows() call per discovery/reverification request,
+    # never a dedicated new provider capability (see
+    # app.modules.datasets.business_key_service). Generous relative to
+    # AI_CORRECTION_COMPARABLE_SAMPLE_SIZE because this needs the WHOLE
+    # table to claim VERIFIED_UNIQUE (via SampleResult.is_full_scan) —
+    # a real full-table scan for genuinely large tables would need a
+    # dedicated provider aggregate capability, deliberately out of scope
+    # here (see Phase 4.6 final report's "known limitations").
+    BUSINESS_KEY_DISCOVERY_SAMPLE_SIZE: int = 5000
 
 
 @lru_cache

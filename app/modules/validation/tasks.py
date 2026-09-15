@@ -160,6 +160,13 @@ def _execute_validation(db, redis_client, jobs_service, audit, job, validation_r
         rule = db.get(Rule, rule_version.rule_id)
         assignment_info.append((assignment, rule_version, rule))
 
+    # Set as soon as assignments are resolved so it is captured no matter
+    # which branch (zero-row / timeout / cancel / completed) this run ends
+    # in — it reflects what was actually resolved for evaluation, never
+    # "how many Rule rows exist" or "how many are ACTIVE".
+    validation_run.rules_evaluated_count = len(assignment_info)
+    validation_run.no_applicable_rules = len(assignment_info) == 0
+
     active_columns = db.execute(
         select(Column).where(Column.dataset_id == dataset.id, Column.is_active.is_(True))
     ).scalars().all()
@@ -196,7 +203,13 @@ def _execute_validation(db, redis_client, jobs_service, audit, job, validation_r
                 if pushdown_column_names
                 else {}
             )
-        except ExactStatsTimeoutError:
+        except (ExactStatsTimeoutError, NotImplementedError):
+            # Some providers (e.g. SQLServerProvider) don't implement the exact-stats
+            # pushdown optimization yet and raise NotImplementedError unconditionally.
+            # That must degrade the same way a timeout does — fall back to computing
+            # COMPLETENESS/UNIQUENESS from the already-sampled rows below — not fail
+            # the whole run. Evaluator behavior is unchanged either way: they already
+            # accept exact_stats=None/missing and compute from `rows` directly.
             exact_stats = {}
     except (SourceTimeoutError, SourceQueryError) as exc:
         message = f"{type(exc).__name__}: {exc}"
@@ -256,6 +269,20 @@ def _execute_validation(db, redis_client, jobs_service, audit, job, validation_r
             if not is_supported_rule_type(rule.rule_type):
                 unsupported_counts[rule.rule_type] = unsupported_counts.get(rule.rule_type, 0) + 1
                 continue
+
+            # Records that this assignment was genuinely evaluated, independent
+            # of whether it produced any failures — a passing rule leaves no
+            # validation_failures rows, so without this a run where every
+            # assigned rule passed would be indistinguishable from one where
+            # no rules were assigned at all when inspecting failure detail.
+            db.add(
+                ValidationMetric(
+                    validation_run_id=validation_run.id,
+                    metric_name="rule_evaluated",
+                    metric_group=str(assignment.id),
+                    metric_value=1,
+                )
+            )
 
             evaluator = get_evaluator(rule.rule_type)
             definition = rule_version.definition or {}

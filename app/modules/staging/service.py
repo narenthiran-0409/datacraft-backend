@@ -1,7 +1,9 @@
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -14,6 +16,7 @@ from app.core.exceptions import (
     StagingAlreadyInProgressError,
     StagingRecordCountExceedsLimitError,
     StagingRunNotFoundError,
+    StagingRunNotMaterializedError,
 )
 from app.core.redis_client import get_redis_client
 from app.db.models import (
@@ -27,6 +30,7 @@ from app.db.models import (
     Dataset,
     DatasetKeyColumn,
     Issue,
+    Job,
     ReviewRun,
     Schema,
     StagingRecord,
@@ -38,6 +42,8 @@ from app.db.models import (
 from app.modules.audit.service import AuditingService
 from app.modules.connections.credential_vault import LocalRedisVaultClient
 from app.modules.lineage.service import LineageService
+from app.modules.staging.destination_naming import STAGING_SCHEMA_NAME, quote_pg_identifier
+from app.modules.staging.type_mapping import normalized_type_to_pg_ddl
 from app.modules.staging.record_builder import (
     ScopeItem,
     StagingIntegrityViolationError,
@@ -69,6 +75,48 @@ _TERMINAL_ERRORS = (
 _BUILD_FAILURE_ERRORS = _TERMINAL_ERRORS + (StagingIntegrityViolationError,)
 
 
+@dataclass(frozen=True)
+class KeyContext:
+    active_columns: list[Column]
+    columns_by_id: dict[uuid.UUID, Column]
+    key_column_names: list[str]
+    effective_key_strategy: str
+
+
+@dataclass(frozen=True)
+class DestinationColumnInfo:
+    name: str
+    normalized_data_type: str
+    staging_data_type: str
+
+
+@dataclass(frozen=True)
+class DestinationMetadata:
+    staging_run: StagingRun
+    columns: list[DestinationColumnInfo]
+    approved_correction_count: int
+    affected_row_count: int
+
+
+@dataclass(frozen=True)
+class MaterializedPreviewResult:
+    columns: list[str]
+    rows: list[dict[str, Any]]
+    total_rows: int
+    limit: int
+    offset: int
+    has_more: bool
+    # record_ref -> that record's corrected_fields (same shape as
+    # StagingRecord.corrected_fields) — authoritative change metadata for
+    # UI highlighting, sourced from staging_records, never recomputed.
+    corrected_fields_by_record_ref: dict[str, list[dict[str, Any]]]
+    # Enough for the caller to derive each returned row's record_ref via
+    # app.modules.validation.record_ref.generate_record_ref — never a
+    # frontend record_ref heuristic.
+    key_strategy: str
+    key_column_names: list[str]
+
+
 class StagingService:
     """Strictly read-only with respect to Phase 1-7 data: never writes to
     approval_requests, approval_decisions, approval_decision_issues,
@@ -92,6 +140,30 @@ class StagingService:
             stmt = stmt.where(StagingRecord.source_drift_status != "UNCHANGED")
         stmt = stmt.order_by(StagingRecord.created_at)
         return list(self._db.execute(stmt).scalars())
+
+    def resolve_key_context(self, dataset: Dataset) -> KeyContext:
+        """Shared by _build_records (the affected-record audit layer) and
+        the Phase 4.12 materialization task — the single place active
+        columns / effective key strategy / key column names are resolved
+        for a dataset, so both consumers agree on row identity."""
+        active_columns = self._db.execute(
+            select(Column)
+            .where(Column.dataset_id == dataset.id, Column.is_active.is_(True))
+            .order_by(Column.ordinal_position)
+        ).scalars().all()
+        columns_by_id = {c.id: c for c in active_columns}
+
+        key_columns = self._db.execute(
+            select(DatasetKeyColumn).where(DatasetKeyColumn.dataset_id == dataset.id).order_by(DatasetKeyColumn.ordinal)
+        ).scalars().all()
+        key_column_names = [
+            columns_by_id[kc.column_id].name for kc in key_columns if kc.column_id in columns_by_id
+        ]
+        effective_key_strategy = dataset.key_strategy if key_column_names else "ROW_INDEX_FALLBACK"
+        return KeyContext(
+            active_columns=list(active_columns), columns_by_id=columns_by_id,
+            key_column_names=key_column_names, effective_key_strategy=effective_key_strategy,
+        )
 
     def _resolve_approved_scope(self, approval_request_id: uuid.UUID) -> dict[str, list[ScopeItem]]:
         rows = self._db.execute(
@@ -233,6 +305,24 @@ class StagingService:
                 "has_source_drift": staging_run.has_source_drift,
             },
         )
+
+        # Phase 4.12 — a successful affected-record audit build additionally
+        # enqueues the full-dataset materialization job. This is additive
+        # only: staging_run.status above is unchanged (still means exactly
+        # "the audit-layer build outcome", nothing here alters it), and
+        # trigger()'s own return type/signature is unchanged too — the route
+        # dispatches the Celery task using the job_id populated here. A run
+        # whose audit build FAILED (the early-return branch above) never
+        # reaches this point, so it never gets a materialization job — there
+        # is nothing yet to materialize corrections from.
+        job = Job(
+            job_type="STAGING_BUILD", entity_type="STAGING_RUN", entity_id=staging_run.id, created_by=actor.id
+        )
+        self._db.add(job)
+        self._db.flush()
+        staging_run.job_id = job.id
+        staging_run.materialization_phase = "QUEUED"
+
         self._db.commit()
         self._db.refresh(staging_run)
         return staging_run
@@ -255,20 +345,10 @@ class StagingService:
                 username=credential.get("username", connection.username), password=credential.get("password", ""),
             )
 
-            # No ordering dependency here (unlike Phase 5's hash input) —
-            # this is a plain lookup dict, order-independent by construction.
-            active_columns = self._db.execute(
-                select(Column).where(Column.dataset_id == dataset.id, Column.is_active.is_(True))
-            ).scalars().all()
-            columns_by_id = {c.id: c for c in active_columns}
-
-            key_columns = self._db.execute(
-                select(DatasetKeyColumn).where(DatasetKeyColumn.dataset_id == dataset.id).order_by(DatasetKeyColumn.ordinal)
-            ).scalars().all()
-            key_column_names = [
-                columns_by_id[kc.column_id].name for kc in key_columns if kc.column_id in columns_by_id
-            ]
-            effective_key_strategy = dataset.key_strategy if key_column_names else "ROW_INDEX_FALLBACK"
+            key_context = self.resolve_key_context(dataset)
+            columns_by_id = key_context.columns_by_id
+            key_column_names = key_context.key_column_names
+            effective_key_strategy = key_context.effective_key_strategy
 
             record_refs_in_order = list(groups.keys())
             fetchable_key_dicts = []
@@ -334,3 +414,125 @@ class StagingService:
             # intact — the same partial-progress pattern already
             # established in Discovery and Profiling.
             self._db.commit()
+
+    def get_materialized(self, staging_run_id: uuid.UUID) -> StagingRun:
+        """Returns the staging run, raising StagingRunNotMaterializedError
+        (never crashing) when it has no physical staging_data table yet —
+        either a pre-4.12 historical run, or one whose materialization job
+        hasn't reached CREATING_TABLE yet."""
+        staging_run = self.get(staging_run_id)
+        if staging_run.destination_table is None:
+            raise StagingRunNotMaterializedError(
+                f"Staging run {staging_run_id} has no materialized dataset "
+                f"(phase={staging_run.materialization_phase!r})"
+            )
+        return staging_run
+
+    def get_destination_metadata(self, staging_run_id: uuid.UUID) -> DestinationMetadata:
+        staging_run = self.get_materialized(staging_run_id)
+        dataset = self._db.get(Dataset, staging_run.dataset_id)
+        key_context = self.resolve_key_context(dataset)
+        columns = [
+            DestinationColumnInfo(
+                name=c.name, normalized_data_type=c.normalized_data_type,
+                staging_data_type=normalized_type_to_pg_ddl(
+                    c.normalized_data_type, max_length=c.max_length,
+                    numeric_precision=c.numeric_precision, numeric_scale=c.numeric_scale,
+                ),
+            )
+            for c in key_context.active_columns
+        ]
+        return DestinationMetadata(
+            staging_run=staging_run, columns=columns,
+            approved_correction_count=staging_run.field_count, affected_row_count=staging_run.record_count,
+        )
+
+    def preview_materialized(
+        self, staging_run_id: uuid.UUID, *, row_filter: str, limit: int, offset: int
+    ) -> MaterializedPreviewResult:
+        """Backend-authoritative preview of the MATERIALIZED physical table
+        — never staging_records.row_snapshot, never a frontend record_ref
+        heuristic. row_filter is one of "ALL", "CHANGED", "UNCHANGED".
+
+        CHANGED/UNCHANGED are resolved via the dataset's own canonical key
+        columns (never a business-key guess) against the row identities
+        already recorded on staging_records for this run — a ROW_INDEX_
+        FALLBACK dataset (no reliable key) always reports CHANGED as empty
+        and UNCHANGED as everything, since no correction could ever have
+        been targeted at a specific physical row in that case (see
+        record_builder.parse_record_ref_to_key_dict)."""
+        staging_run = self.get_materialized(staging_run_id)
+        dataset = self._db.get(Dataset, staging_run.dataset_id)
+        key_context = self.resolve_key_context(dataset)
+
+        dest_schema = staging_run.destination_schema
+        dest_table = staging_run.destination_table
+        qualified_table = f"{quote_pg_identifier(dest_schema)}.{quote_pg_identifier(dest_table)}"
+
+        dest_columns = [
+            row[0]
+            for row in self._db.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = :schema AND table_name = :table ORDER BY ordinal_position"
+                ),
+                {"schema": dest_schema, "table": dest_table},
+            ).all()
+        ]
+
+        staging_records = self._db.execute(
+            select(StagingRecord).where(StagingRecord.staging_run_id == staging_run.id)
+        ).scalars().all()
+        corrected_fields_by_record_ref = {r.record_ref: r.corrected_fields for r in staging_records}
+
+        changed_key_dicts: list[dict[str, Any]] = []
+        for record_ref in corrected_fields_by_record_ref:
+            key_dict = parse_record_ref_to_key_dict(
+                record_ref, key_strategy=key_context.effective_key_strategy,
+                key_column_names=key_context.key_column_names,
+            )
+            if key_dict is not None:
+                changed_key_dicts.append(key_dict)
+
+        where_clause = ""
+        params: dict[str, Any] = {}
+        if row_filter in ("CHANGED", "UNCHANGED") and key_context.key_column_names:
+            if not changed_key_dicts:
+                # Nothing is targetable by key — CHANGED is vacuously empty,
+                # UNCHANGED is everything (no WHERE clause needed).
+                if row_filter == "CHANGED":
+                    where_clause = "WHERE FALSE"
+            else:
+                key_cols_sql = ", ".join(quote_pg_identifier(c) for c in key_context.key_column_names)
+                tuple_placeholders = []
+                for i, key_dict in enumerate(changed_key_dicts):
+                    names = []
+                    for j, col in enumerate(key_context.key_column_names):
+                        pname = f"k{i}_{j}"
+                        params[pname] = key_dict[col]
+                        names.append(f":{pname}")
+                    tuple_placeholders.append("(" + ", ".join(names) + ")")
+                operator = "IN" if row_filter == "CHANGED" else "NOT IN"
+                where_clause = f"WHERE ({key_cols_sql}) {operator} ({', '.join(tuple_placeholders)})"
+        elif row_filter == "CHANGED":
+            # ROW_INDEX_FALLBACK — no key at all, so CHANGED is always empty.
+            where_clause = "WHERE FALSE"
+
+        total_rows = self._db.execute(
+            text(f"SELECT COUNT(*) FROM {qualified_table} {where_clause}"), params
+        ).scalar_one()
+
+        order_columns = key_context.key_column_names or dest_columns
+        order_sql = ", ".join(quote_pg_identifier(c) for c in order_columns)
+        page_params = {**params, "limit": limit, "offset": offset}
+        page_rows = self._db.execute(
+            text(f"SELECT * FROM {qualified_table} {where_clause} ORDER BY {order_sql} LIMIT :limit OFFSET :offset"),
+            page_params,
+        ).mappings().all()
+
+        return MaterializedPreviewResult(
+            columns=dest_columns, rows=[dict(r) for r in page_rows], total_rows=total_rows, limit=limit,
+            offset=offset, has_more=offset + len(page_rows) < total_rows,
+            corrected_fields_by_record_ref=corrected_fields_by_record_ref,
+            key_strategy=key_context.effective_key_strategy, key_column_names=key_context.key_column_names,
+        )

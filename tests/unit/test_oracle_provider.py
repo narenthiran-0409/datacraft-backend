@@ -130,6 +130,17 @@ def test_sample_rows_quotes_identifiers_containing_double_quotes() -> None:
     assert '"weird""owner"."weird""table"' in executed_sql
 
 
+def test_fetch_rows_by_keys_raises_not_implemented() -> None:
+    """Phase 3 audit: Oracle has no real targeted-row-retrieval implementation
+    yet — must raise NotImplementedError explicitly, never silently fall
+    back to a full-table scan or fake support."""
+    import pytest
+
+    provider = _make_provider()
+    with pytest.raises(NotImplementedError):
+        provider.fetch_rows_by_keys("APP_OWNER", "ORDERS", [{"ID": 1}])
+
+
 def test_sample_rows_wraps_driver_error() -> None:
     import oracledb
     import pytest
@@ -142,3 +153,80 @@ def test_sample_rows_wraps_driver_error() -> None:
 
     with pytest.raises(SourceQueryError):
         provider.sample_rows("APP_OWNER", "ORDERS", sample_size=20)
+
+
+def test_count_rows_issues_count_star() -> None:
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider, fetchone_result=(13,))
+
+    assert provider.count_rows("APP_OWNER", "ORDERS") == 13
+    assert "COUNT(*)" in cur.execute.call_args[0][0]
+
+
+def test_count_rows_wraps_driver_error() -> None:
+    import pytest
+    import oracledb
+
+    from app.source_adapters.exceptions import SourceQueryError
+
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider)
+    cur.execute.side_effect = oracledb.Error("boom")
+
+    with pytest.raises(SourceQueryError):
+        provider.count_rows("APP_OWNER", "ORDERS")
+
+
+def test_iter_rows_yields_bounded_batches_using_offset_fetch_next() -> None:
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider)
+    cur.description = [("ID",), ("NAME",)]
+    cur.fetchall.side_effect = [[(1, "a"), (2, "b")], [(3, "c")]]
+
+    batches = list(provider.iter_rows("APP_OWNER", "ORDERS", ["ID", "NAME"], batch_size=2, order_by=["ID"]))
+
+    assert batches == [
+        [{"ID": 1, "NAME": "a"}, {"ID": 2, "NAME": "b"}],
+        [{"ID": 3, "NAME": "c"}],
+    ]
+    assert cur.execute.call_count == 2
+    first_call = cur.execute.call_args_list[0]
+    assert "OFFSET :offset_val ROWS FETCH NEXT :limit_val ROWS ONLY" in first_call[0][0]
+    assert first_call.kwargs == {"offset_val": 0, "limit_val": 2}
+    second_call = cur.execute.call_args_list[1]
+    assert second_call.kwargs == {"offset_val": 2, "limit_val": 2}
+
+
+def test_iter_rows_empty_table_yields_no_batches() -> None:
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider)
+    cur.description = [("ID",)]
+    cur.fetchall.side_effect = [[]]
+
+    assert list(provider.iter_rows("APP_OWNER", "ORDERS", ["ID"], batch_size=100)) == []
+
+
+def test_iter_rows_falls_back_to_selected_columns_when_no_order_by() -> None:
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider)
+    cur.description = [("A",), ("B",)]
+    cur.fetchall.side_effect = [[]]
+
+    list(provider.iter_rows("APP_OWNER", "ORDERS", ["A", "B"], batch_size=10, order_by=None))
+
+    executed_sql = cur.execute.call_args_list[0][0][0]
+    assert '"A"' in executed_sql and '"B"' in executed_sql
+
+
+def test_iter_rows_wraps_driver_error() -> None:
+    import pytest
+    import oracledb
+
+    from app.source_adapters.exceptions import SourceQueryError
+
+    provider = _make_provider()
+    cur = _wire_mock_connection(provider)
+    cur.execute.side_effect = oracledb.Error("boom")
+
+    with pytest.raises(SourceQueryError):
+        list(provider.iter_rows("APP_OWNER", "ORDERS", ["ID"], batch_size=10))

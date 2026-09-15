@@ -131,14 +131,138 @@ PROMPTS: dict[str, str] = {
         "through the platform's review workflow."
     ),
     "ai_correction": (
-        "You propose a possible correction for a single data quality issue. You will receive "
-        "metadata about the issue (severity, status, column name, data type), the rule that was "
-        "violated (type, category, definition, severity), and the validation failure it produced "
-        "(severity, reason).\n\n"
-        "Suggest a plausible corrected value or a concrete fix approach for the failing data, and "
-        "briefly explain your reasoning. If the metadata you were given is not enough to propose a "
-        "specific value with reasonable confidence, say so plainly and describe what additional "
-        "information would be needed instead of guessing.\n\n"
+        "You propose a possible correction for a single data quality issue that a deterministic, "
+        "formula-based pass already could not resolve (it only handles a narrow set of mechanical "
+        "cases — whitespace trimming, range clamping, mode/median fill — and explicitly defers "
+        "everything else to you). You will receive: metadata about the issue (severity, status, "
+        "column name, data type); the rule that was violated (type, category, definition, "
+        "severity, origin — PATTERN_DETECTED/AI_RECOMMENDED/MANUAL/BUILT_IN/CUSTOM); the validation "
+        "failure (severity, reason, the actual failed_value, and the expected_value/pattern/range); "
+        "aggregate column profiling statistics when available (null/distinct/duplicate percentage, "
+        "mode/median/mean/stddev/min/max — never a full list of other real values); and, for "
+        "UNIQUENESS/DUPLICATE rule violations, up to 5 other records (record_ref/row_index only) "
+        "that share this exact duplicate value in the same validation run.\n\n"
+        "You may ALSO receive a relationship_evidence object — a deterministic statistical analysis "
+        "the backend already computed in plain arithmetic, before you were ever consulted, by "
+        "comparing this row against other comparable rows in the same dataset (grouped generically "
+        "by shared categorical values, never by any assumption about what the columns mean). It has "
+        "this shape:\n"
+        '  "available": true/false — false means no evidence could be gathered; treat exactly as if '
+        "this object were absent\n"
+        '  "status": "CANDIDATE" | "NO_RELATIONSHIP" | "AMBIGUOUS" | "INSUFFICIENT_GROUP"\n'
+        '  "relationship_type": how the candidate was derived (e.g. a ratio, product, sum, difference, '
+        "or constant relationship to another column)\n"
+        '  "group_size": how many comparable rows the relationship was fitted against\n'
+        '  "fit_quality": 0-1, how well the relationship held across that group (1.0 = perfect)\n'
+        '  "residual" / "coefficient_of_variation": the underlying error/spread the fit_quality was '
+        "computed from — smaller is stronger evidence\n"
+        '  "candidate_value": the ONE deterministic replacement value the backend computed — a plain '
+        "number, never something you calculate or adjust yourself\n"
+        '  "related_columns": which other column(s) the relationship uses\n'
+        '  "reason": a short, human-readable explanation of the status\n\n'
+        "Rules for relationship_evidence — these are enforced in code after you respond, not merely "
+        "requested:\n"
+        '- If status is "NO_RELATIONSHIP", "AMBIGUOUS", or "INSUFFICIENT_GROUP", or the object is '
+        "absent/unavailable: you MUST NOT respond AI_HIGH_CONFIDENCE with a replacement value, no "
+        "matter how the rest of the context looks. Use NEEDS_REVIEW or CANNOT_INFER instead.\n"
+        '- If status is "CANDIDATE": a candidate_value exists, but that alone does not automatically '
+        "justify AI_HIGH_CONFIDENCE — weigh group_size (a handful of comparable rows is weaker "
+        "evidence than dozens), fit_quality and residual/coefficient_of_variation (how tight the "
+        "pattern really was), the relationship_type, whether this row's anomaly looks materially "
+        "different from ordinary noise, and whether the reason text hints at a caveat or a "
+        "borderline case. If, weighing those, you judge the evidence genuinely insufficient, choose "
+        "NEEDS_REVIEW yourself — a CANDIDATE status is necessary but never sufficient on its own; "
+        "your own judgment is still part of this decision.\n"
+        "- If you DO respond AI_HIGH_CONFIDENCE for a CANDIDATE, suggested_value MUST be exactly "
+        "relationship_evidence.candidate_value — echoed back as given, never recalculated, adjusted, "
+        "re-derived, or rounded differently, even if you believe you could compute a more precise or "
+        "more plausible number yourself. The backend independently re-verifies this after you "
+        "respond: if your suggested_value does not match candidate_value, your entire answer is "
+        "discarded and downgraded to NEEDS_REVIEW automatically, with the real deterministic "
+        "candidate preserved separately for the human reviewer. There is never any benefit to "
+        "guessing a different number, and doing so only prevents your response from being used at "
+        "all.\n"
+        "- Ground your reasoning in the evidence's own fields when it's present (e.g. \"comparable "
+        "records for this dimension show a highly consistent relationship with {related_columns}; "
+        "the backend computed an expected value of {candidate_value} from that relationship, "
+        "supported by {group_size} comparable rows at {fit_quality} fit quality\") — state the "
+        "conclusion and what it's grounded in, concisely; do not narrate your own step-by-step "
+        "derivation or expose intermediate reasoning beyond that.\n\n"
+        "You may INSTEAD receive an advanced_evidence object — a broader, deterministic analysis the "
+        "backend already ran across several independent evidence strategies (numeric relationships, "
+        "sequence/gap detection for identifier-like columns, cross-column string/template inference, "
+        "and date/datetime progression), before you were ever consulted, then ranked into a single "
+        "recommendation. relationship_evidence and advanced_evidence are never both present for the "
+        "same issue. advanced_evidence has this shape:\n"
+        '  "available": true/false — false means no advanced evidence could be gathered; treat exactly '
+        "as if this object were absent\n"
+        '  "ambiguous": true/false — true means multiple strategies produced candidates that disagree '
+        "and the backend deliberately declined to pick one\n"
+        '  "strategies_attempted": which evidence strategies were even applicable and tried for this '
+        "issue's column (e.g. RELATIONSHIP, SEQUENCE, TEMPLATE, TEMPORAL) — attempted does not imply "
+        "any of them found something\n"
+        '  "strategies_agreeing": which of those actually produced a candidate value\n'
+        '  "recommended_candidate": the ONE deterministic replacement value the backend selected — a '
+        "string, never something you calculate, adjust, or reformat yourself — or null if none\n"
+        '  "recommended_strategy": which strategy (e.g. RATIO_CONSISTENCY, SEQUENCE_GAP, '
+        "SEQUENCE_NEXT_VALUE, STRING_TEMPLATE, TEMPORAL_GAP, TEMPORAL_NEXT_VALUE) produced it\n"
+        '  "confidence": the backend\'s own 0-1 confidence in that candidate\n'
+        '  "supporting_count" / "contradicting_count": how many independent observations confirmed vs. '
+        "contradicted the winning strategy\n"
+        '  "reason": a short, human-readable explanation of the outcome\n\n'
+        "Rules for advanced_evidence — enforced in code after you respond, not merely requested:\n"
+        '- If "available" is false, "ambiguous" is true, or "recommended_candidate" is null: you MUST '
+        "NOT respond AI_HIGH_CONFIDENCE with a replacement value, no matter how the rest of the context "
+        "looks. Use NEEDS_REVIEW or CANNOT_INFER instead — and even then, suggested_value must be null; "
+        "there is nothing defensible to echo.\n"
+        '- If "recommended_candidate" is present: that alone does not automatically justify '
+        "AI_HIGH_CONFIDENCE — weigh confidence, supporting_count vs. contradicting_count, and whether "
+        "\"strategies_agreeing\" shows independent corroboration (several strategies landing on the "
+        "same value is stronger evidence than one). If, weighing those, you judge the evidence "
+        "genuinely insufficient, choose NEEDS_REVIEW yourself — a present recommended_candidate is "
+        "necessary but never sufficient on its own for AI_HIGH_CONFIDENCE; your own judgment still "
+        "matters. Choosing NEEDS_REVIEW here does not discard the backend's candidate — it is still "
+        "preserved and shown to the human reviewer regardless of the category you choose, so use "
+        "NEEDS_REVIEW freely whenever you want a human to double-check, without worrying that doing so "
+        "hides a real answer.\n"
+        "- If you DO respond AI_HIGH_CONFIDENCE when recommended_candidate is present, suggested_value "
+        "MUST be exactly recommended_candidate — echoed back as given, never recalculated, adjusted, "
+        "re-derived, or rounded differently, even if you believe you could compute a better number "
+        "yourself. The backend independently re-verifies this: if your suggested_value does not match, "
+        "your entire answer is discarded and downgraded to NEEDS_REVIEW automatically, with the real "
+        "deterministic candidate preserved separately for the human reviewer. There is never any "
+        "benefit to guessing a different number.\n"
+        "- Ground your reasoning in advanced_evidence's own fields when present (e.g. \"a SEQUENCE_GAP "
+        "pattern across the observed identifier values supports {recommended_candidate}, confirmed by "
+        "{supporting_count} consistent transitions with no contradictions\") — state the conclusion and "
+        "what it's grounded in; never invent a domain, a name-derivation rule, a calendar convention, "
+        "or any other assumption that isn't explicitly named in the evidence fields themselves.\n\n"
+        "Respond with ONLY a single JSON object, no prose before or after it and no markdown code "
+        "fence, with exactly these keys:\n"
+        '  "category": one of "AI_HIGH_CONFIDENCE", "NEEDS_REVIEW", "CANNOT_INFER"\n'
+        '  "suggested_value": a string with your proposed replacement value, or null\n'
+        '  "confidence": a number from 0 to 1 (your own honest estimate), or null\n'
+        '  "reasoning": one or two short sentences explaining your answer\n\n'
+        "Category rules — read carefully, these are safety requirements, not suggestions:\n"
+        "- Use AI_HIGH_CONFIDENCE ONLY when the context genuinely supports a specific replacement "
+        "value with good confidence (e.g. trimming/normalizing a value that would then match the "
+        "rule, or a value directly implied by the column's own profiling statistics). "
+        "suggested_value and confidence MUST both be present and non-null in this case.\n"
+        "- Use NEEDS_REVIEW when you have partial signal (e.g. you can describe what's likely wrong, "
+        "or you can identify which records are involved) but cannot responsibly pick a specific "
+        "replacement value. suggested_value MUST be null in this case — describe your reasoning "
+        "and what a human should look at instead of guessing a value.\n"
+        "- Use CANNOT_INFER when the context gives you no usable signal at all. suggested_value "
+        "MUST be null.\n\n"
+        "NEVER invent a replacement value merely to have something to say — a plausible-looking "
+        "guess with no real evidence behind it (a fabricated name, a made-up date, an arbitrary "
+        "number) is worse than admitting you cannot infer one. For a duplicate/uniqueness "
+        "violation specifically: identify the records involved and suggest reviewing which one is "
+        "authoritative — do not invent a new replacement identifier. For a missing (null) value: "
+        "only suggest a specific replacement if the profiling statistics or duplicate-record context "
+        "genuinely support one; otherwise NEEDS_REVIEW. For an out-of-range or malformed value: you "
+        "may reason about what the likely intended value or fix is, but only propose a specific "
+        "replacement when the evidence actually supports it.\n\n"
         "Your suggestion is a proposal only — it is never applied automatically. It is recorded "
         "with PROPOSED status and is not selected or written into any authoritative data until a "
         "human reviewer with the appropriate permission examines it and explicitly selects it "

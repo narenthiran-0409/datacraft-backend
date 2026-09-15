@@ -373,3 +373,186 @@ def test_cancel_in_progress_validation(
     finally:
         db.execute(text(f"DROP TABLE IF EXISTS {table_name}"))
         db.commit()
+
+
+def test_zero_rule_assignments_is_never_indistinguishable_from_a_genuine_all_pass_run(
+    db: Session, redis_client, admin_user: User, pg_connection: Connection
+) -> None:
+    """The core regression this feature exists to prevent: a dataset with
+    rows but NO enabled RuleAssignments must report rules_evaluated_count=0
+    and no_applicable_rules=True, even though every row still trivially
+    gets PASSED and quality_score still computes to 100.00 under the
+    existing per-row loop. The wire-level signal that nothing was actually
+    checked must not depend on the caller re-deriving it from "0 failures
+    + 100 score", which is exactly what made the old behavior look like a
+    genuine successful validation.
+    """
+    table_name = f"dq_val_noassign_{uuid.uuid4().hex[:8]}"
+    try:
+        dataset = _make_dataset(
+            db, redis_client, admin_user, pg_connection, table_name,
+            rows_sql=f"INSERT INTO {table_name} VALUES (1,'a',10),(2,'b',20)",
+        )
+        # Deliberately no _assign_rule call — zero enabled RuleAssignments.
+
+        validation_run, job = ValidationService(db).start_validation(
+            actor=admin_user, dataset_id=dataset.id, template_id=None
+        )
+        run_validation(str(job.id), str(validation_run.id))
+
+        db.expire_all()
+        completed_run = db.get(ValidationRun, validation_run.id)
+
+        assert completed_run.status == "COMPLETED"
+        assert completed_run.total_rows == 2
+        assert completed_run.passed_rows == 2
+        assert float(completed_run.quality_score) == 100.00  # old ambiguous signal, still true
+        # New, unambiguous signal that must accompany it:
+        assert completed_run.rules_evaluated_count == 0
+        assert completed_run.no_applicable_rules is True
+
+        evaluated = ValidationService(db).list_evaluated_rules(validation_run_id=completed_run.id)
+        assert evaluated == []
+    finally:
+        db.execute(text(f"DROP TABLE IF EXISTS {table_name}"))
+        db.commit()
+
+
+def test_genuine_all_pass_run_reports_nonzero_rules_evaluated_and_names_them(
+    db: Session, redis_client, admin_user: User, pg_connection: Connection
+) -> None:
+    """The mirror-image case (Scenario C): rules ARE assigned, all data is
+    valid, quality_score is genuinely 100 — and this must be distinguishable
+    from the zero-assignment case above via rules_evaluated_count and the
+    evaluated-rules detail (rule name + column). Deliberately includes
+    COMPLETENESS and UNIQUENESS alongside RANGE — those two exercise the
+    exact-stats pushdown path (provider.get_dataset_column_stats), the exact
+    code path the NotImplementedError-fallback regression test below
+    targets, and all three produce zero failures, so none leave a
+    validation_failures row — rules_evaluated_count / list_evaluated_rules
+    is the only proof any of them actually ran.
+    """
+    table_name = f"dq_val_allpass_{uuid.uuid4().hex[:8]}"
+    try:
+        dataset = _make_dataset(
+            db, redis_client, admin_user, pg_connection, table_name,
+            rows_sql=f"INSERT INTO {table_name} VALUES (1,'a',10),(2,'b',20),(3,'c',30)",
+        )
+        from app.db.models import Column
+
+        val_col = db.execute(select(Column).where(Column.dataset_id == dataset.id, Column.name == "val")).scalar_one()
+        score_col = db.execute(
+            select(Column).where(Column.dataset_id == dataset.id, Column.name == "score")
+        ).scalar_one()
+        range_assignment = _assign_rule(
+            db, admin_user, dataset, rule_type="RANGE", definition={"min": 0, "max": 100}, column_id=score_col.id
+        )
+        completeness_assignment = _assign_rule(
+            db, admin_user, dataset, rule_type="COMPLETENESS", definition={"max_null_percentage": 0}, column_id=val_col.id
+        )
+        uniqueness_assignment = _assign_rule(
+            db, admin_user, dataset, rule_type="UNIQUENESS", definition={"max_duplicate_percentage": 0}, column_id=val_col.id
+        )
+
+        validation_run, job = ValidationService(db).start_validation(
+            actor=admin_user, dataset_id=dataset.id, template_id=None
+        )
+        run_validation(str(job.id), str(validation_run.id))
+
+        db.expire_all()
+        completed_run = db.get(ValidationRun, validation_run.id)
+
+        assert completed_run.status == "COMPLETED"
+        assert completed_run.total_rows == 3
+        assert completed_run.passed_rows == 3
+        assert float(completed_run.quality_score) == 100.00
+        assert completed_run.rules_evaluated_count == 3
+        assert completed_run.no_applicable_rules is False
+
+        evaluated = ValidationService(db).list_evaluated_rules(validation_run_id=completed_run.id)
+        assert len(evaluated) == 3
+        by_assignment_id = {e["rule_assignment_id"]: e for e in evaluated}
+        assert by_assignment_id[range_assignment.id]["rule_type"] == "RANGE"
+        assert by_assignment_id[range_assignment.id]["column_name"] == "score"
+        assert by_assignment_id[completeness_assignment.id]["rule_type"] == "COMPLETENESS"
+        assert by_assignment_id[completeness_assignment.id]["column_name"] == "val"
+        assert by_assignment_id[uniqueness_assignment.id]["rule_type"] == "UNIQUENESS"
+        assert by_assignment_id[uniqueness_assignment.id]["column_name"] == "val"
+        assert all(e["rule_name"] for e in evaluated)
+    finally:
+        db.execute(text(f"DROP TABLE IF EXISTS {table_name}"))
+        db.commit()
+
+
+def test_provider_not_implementing_exact_stats_falls_back_to_sampled_rows_instead_of_failing(
+    db: Session, redis_client, admin_user: User, pg_connection: Connection, monkeypatch
+) -> None:
+    """Regression test for a real production incident: SQLServerProvider.
+    get_dataset_column_stats() is an unconditional NotImplementedError stub.
+    Before this fix, that propagated uncaught past the
+    `except ExactStatsTimeoutError` guard, up through _execute_validation's
+    try/except (which only catches SourceTimeoutError/SourceQueryError), and
+    was only caught by run_validation's outer catch-all — marking the whole
+    run FAILED with 0 rows scored, even though sampling itself had already
+    succeeded and every assigned rule was otherwise perfectly evaluable from
+    the sampled rows alone.
+
+    Provider-agnostic by design: wraps the real PostgreSQLProvider (via the
+    real get_provider() factory) so this proves the fix works for ANY
+    provider that raises NotImplementedError here, not something specific
+    to SQL Server (which isn't exercised by this test suite at all).
+    """
+    from app.modules.validation import tasks as validation_tasks
+
+    table_name = f"dq_val_noexact_{uuid.uuid4().hex[:8]}"
+    try:
+        dataset = _make_dataset(
+            db, redis_client, admin_user, pg_connection, table_name,
+            rows_sql=f"INSERT INTO {table_name} VALUES (1,'a',10),(2,NULL,20),(3,'c',30)",
+        )
+        from app.db.models import Column
+
+        val_col = db.execute(select(Column).where(Column.dataset_id == dataset.id, Column.name == "val")).scalar_one()
+        _assign_rule(
+            db, admin_user, dataset, rule_type="COMPLETENESS", definition={"max_null_percentage": 0}, column_id=val_col.id
+        )
+
+        real_get_provider = validation_tasks.get_provider
+
+        def _get_provider_with_unimplemented_exact_stats(*args, **kwargs):
+            provider = real_get_provider(*args, **kwargs)
+
+            def _raise_not_implemented(*_args, **_kwargs):
+                raise NotImplementedError("Implemented in a later phase")
+
+            provider.get_dataset_column_stats = _raise_not_implemented
+            return provider
+
+        monkeypatch.setattr(validation_tasks, "get_provider", _get_provider_with_unimplemented_exact_stats)
+
+        validation_run, job = ValidationService(db).start_validation(
+            actor=admin_user, dataset_id=dataset.id, template_id=None
+        )
+        run_validation(str(job.id), str(validation_run.id))
+
+        db.expire_all()
+        completed_run = db.get(ValidationRun, validation_run.id)
+
+        # The key assertion: NOT FAILED. Sampled-row fallback still finds the
+        # real NULL at row_index=1 — this is genuine evaluation, not a run
+        # that merely avoided crashing.
+        assert completed_run.status == "COMPLETED"
+        assert completed_run.total_rows == 3
+        assert completed_run.passed_rows == 2
+        assert completed_run.failed_rows == 1
+        assert completed_run.rules_evaluated_count == 1
+        assert completed_run.no_applicable_rules is False
+
+        failures = db.execute(
+            select(ValidationFailure).where(ValidationFailure.validation_run_id == completed_run.id)
+        ).scalars().all()
+        assert len(failures) == 1
+        assert "null" in (failures[0].reason or "").lower()
+    finally:
+        db.execute(text(f"DROP TABLE IF EXISTS {table_name}"))
+        db.commit()

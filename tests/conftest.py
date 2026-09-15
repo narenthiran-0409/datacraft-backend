@@ -197,6 +197,33 @@ def db() -> Session:
         session.close()
 
 
+@pytest.fixture(autouse=True)
+def _reset_ai_correction_evidence_flags(monkeypatch):
+    """Phase 4.5 acceptance-fix (Blocker 2): every test's baseline for
+    these two flags is the shipped default (False), regardless of what the
+    process-level environment (.env, an exported shell variable, a CI
+    config) happens to set. Without this, a test written before either
+    flag existed — the overwhelming majority of this project's AI
+    correction tests — silently inherits whatever the environment
+    currently says instead of the value it actually assumes, and behaves
+    differently for a reason entirely unrelated to anything the test
+    itself does. This was concretely observed: exporting
+    AI_CORRECTION_ADVANCED_INFERENCE_ENABLED=true for one pytest invocation
+    (to exercise Phase 4.5's own tests under a realistic pilot
+    configuration) caused 18 unrelated, pre-existing Phase 1-3/Phase 6
+    tests to fail, none of which reference the advanced flag at all.
+
+    A test that wants to exercise evidence/advanced mode still does so via
+    its own monkeypatch.setattr call (or a helper like _enable_evidence/
+    _enable_advanced that does so) — since that call happens from within
+    the test body, strictly after this autouse fixture has already run,
+    it correctly overrides this default for that one test, and
+    monkeypatch's own teardown restores the true pre-test value
+    regardless of how many times a single test re-sets it."""
+    monkeypatch.setattr(settings, "AI_CORRECTION_EVIDENCE_ENABLED", False)
+    monkeypatch.setattr(settings, "AI_CORRECTION_ADVANCED_INFERENCE_ENABLED", False)
+
+
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(app)

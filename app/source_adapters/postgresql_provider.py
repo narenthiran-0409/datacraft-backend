@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Iterator
 
 from app.core.config import settings
 from app.source_adapters.base import (
@@ -432,6 +432,46 @@ class PostgreSQLProvider(SourceDatabaseProvider):
                 return cur.fetchall()
         except psycopg.Error as exc:
             raise SourceQueryError(str(exc)) from exc
+
+    def count_rows(self, schema: str, table: str) -> int:
+        try:
+            with self._connection().cursor() as cur:
+                query = sql.SQL("SELECT COUNT(*) FROM {schema}.{table}").format(
+                    schema=sql.Identifier(schema), table=sql.Identifier(table)
+                )
+                cur.execute(query)
+                return cur.fetchone()[0]
+        except psycopg.Error as exc:
+            raise SourceQueryError(str(exc)) from exc
+
+    def iter_rows(
+        self, schema: str, table: str, columns: list[str], batch_size: int, order_by: list[str] | None = None
+    ) -> Iterator[list[dict[str, Any]]]:
+        order_columns = order_by if order_by else columns
+
+        @with_timeout(settings.STAGING_MATERIALIZATION_QUERY_TIMEOUT_SECONDS)
+        def _fetch_batch(offset: int) -> list[dict[str, Any]]:
+            try:
+                with self._connection().cursor(row_factory=dict_row) as cur:
+                    query = sql.SQL("SELECT {cols} FROM {schema}.{table} ORDER BY {order} LIMIT %s OFFSET %s").format(
+                        cols=sql.SQL(", ").join(sql.Identifier(c) for c in columns),
+                        schema=sql.Identifier(schema), table=sql.Identifier(table),
+                        order=sql.SQL(", ").join(sql.Identifier(c) for c in order_columns),
+                    )
+                    cur.execute(query, (batch_size, offset))
+                    return cur.fetchall()
+            except psycopg.Error as exc:
+                raise SourceQueryError(str(exc)) from exc
+
+        offset = 0
+        while True:
+            batch = _fetch_batch(offset)
+            if not batch:
+                return
+            yield batch
+            if len(batch) < batch_size:
+                return
+            offset += batch_size
 
     def close(self) -> None:
         if self._conn is not None and not self._conn.closed:

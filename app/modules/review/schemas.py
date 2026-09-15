@@ -48,12 +48,23 @@ class CorrectionSuggestionResponse(BaseModel):
     ai_suggestion_id: uuid.UUID | None
     suggested_value: str
     confidence: Decimal
+    category: str
     fix_type: str
     reasoning: str | None
     is_selected: bool
     selected_by: uuid.UUID | None
     selected_at: datetime | None
     created_at: datetime
+    # Phase 4.10 — expose the Phase 4.1 evidence columns (already persisted
+    # by AISuggestionService.generate_corrections whenever advanced
+    # inference actually ran for an issue — see app/db/models/review.py's
+    # CorrectionSuggestion.strategy/evidence_detail docstring) so the
+    # frontend can show "how" a suggestion was produced. No new computation:
+    # both fields are read straight through via from_attributes. NULL for
+    # every RULE_BASED suggestion and for any AI suggestion produced before
+    # advanced inference was enabled / attempted for that issue.
+    strategy: str | None = None
+    evidence_detail: dict | None = None
 
     model_config = {"from_attributes": True}
 
@@ -98,3 +109,38 @@ class RejectSuggestionRequest(BaseModel):
 
 class CorrectIssueRequest(BaseModel):
     final_value: str
+
+
+class AITracePromptResponse(BaseModel):
+    id: uuid.UUID
+    key: str
+    version_number: int
+
+
+class AITraceUsageEntryResponse(BaseModel):
+    id: uuid.UUID
+    provider: str
+    model: str
+    prompt_version_id: uuid.UUID | None
+    input_tokens: int | None
+    output_tokens: int | None
+    total_tokens: int | None
+    latency_ms: int | None
+    status: str
+    created_at: datetime
+
+
+class AITraceResponse(BaseModel):
+    """Phase 4.9 — audit-oriented, read-only. Never includes raw prompt
+    body or raw model response, and never includes any credential/secret
+    — see AITraceService's own docstring for exactly what this is built
+    from."""
+
+    correction_suggestion_id: uuid.UUID
+    ai_suggestion_id: uuid.UUID | None
+    is_llm_backed: bool
+    linkage_status: str
+    provider: str | None
+    model: str | None
+    prompt: AITracePromptResponse | None
+    usage: list[AITraceUsageEntryResponse]

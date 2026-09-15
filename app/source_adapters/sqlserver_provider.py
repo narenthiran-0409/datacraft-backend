@@ -6,7 +6,7 @@ instance available here. See tests/unit/test_sqlserver_provider.py.
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Iterator
 
 from app.core.config import settings
 from app.source_adapters.base import ColumnExactStats, ConnectionTestResult, ProviderCapabilities, SampleResult, SourceDatabaseProvider
@@ -322,12 +322,115 @@ class SQLServerProvider(SourceDatabaseProvider):
             cur = self._connection().cursor()
             query = f"SELECT TOP (?) * FROM {_quote_ident(schema)}.{_quote_ident(table)}"
             cur.execute(query, sample_size)
-            return SampleResult(rows=_rows_as_dicts(cur), is_full_scan=False)
+            rows = _rows_as_dicts(cur)
+            # TOP (N) is the ONLY truncation mechanism this query uses — no
+            # TABLESAMPLE, no probabilistic/estimate-driven branching (unlike
+            # PostgreSQLProvider). It deterministically returns
+            # min(N, actual_row_count) rows, so fewer rows than requested
+            # coming back is conclusive proof the table has no more rows to
+            # give — a genuine full scan, not a guess. Exactly N rows back is
+            # the ambiguous case (the table may have more): stays False.
+            return SampleResult(rows=rows, is_full_scan=len(rows) < sample_size)
         except pyodbc.Error as exc:
             raise SourceQueryError(str(exc)) from exc
 
     def fetch_rows_by_keys(self, schema: str, table: str, keys: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        raise NotImplementedError("Implemented in a later phase")
+        """Exact, parameterized lookup by one or more key-column combinations
+        (single-column or composite). T-SQL has no row-value `(a, b) IN
+        ((1, 2), (3, 4))` syntax (unlike PostgreSQL's real implementation in
+        postgresql_provider.py), so the portable, still fully parameterized
+        equivalent is an OR-of-ANDs: `(col1 = ? AND col2 = ?) OR (col1 = ? AND
+        col2 = ?) OR ...`. Every VALUE is bound as a `?` placeholder — never
+        string-interpolated; only identifiers (schema/table/column names) are
+        interpolated, and only through `_quote_ident`'s bracket-escaping, the
+        same helper `sample_rows` already uses. A None-valued key component
+        becomes `col IS NULL` (bound `=` is never true against NULL in SQL,
+        so this is required for correctness, not just an edge-case nicety).
+
+        Every dict in `keys` must share the exact same set of key column
+        names — mirrors PostgreSQLProvider's own implicit assumption
+        (documented there as "true by construction for one staging attempt
+        against one dataset's fixed key strategy"), but enforced explicitly
+        here with a clear error rather than left to an incidental KeyError.
+        """
+        if not keys:
+            return []
+
+        key_columns = list(keys[0].keys())
+        if not key_columns:
+            raise SourceQueryError("fetch_rows_by_keys: a key dict must name at least one key column")
+        for key_dict in keys:
+            if list(key_dict.keys()) != key_columns:
+                raise SourceQueryError(
+                    "fetch_rows_by_keys: every key dict must share the same set of key column names"
+                )
+
+        try:
+            cur = self._connection().cursor()
+
+            group_clauses = []
+            params: list[Any] = []
+            for key_dict in keys:
+                col_clauses = []
+                for col in key_columns:
+                    value = key_dict[col]
+                    if value is None:
+                        col_clauses.append(f"{_quote_ident(col)} IS NULL")
+                    else:
+                        col_clauses.append(f"{_quote_ident(col)} = ?")
+                        params.append(value)
+                group_clauses.append("(" + " AND ".join(col_clauses) + ")")
+
+            order_by = ", ".join(_quote_ident(col) for col in key_columns)
+            query = (
+                f"SELECT * FROM {_quote_ident(schema)}.{_quote_ident(table)} "
+                f"WHERE {' OR '.join(group_clauses)} "
+                f"ORDER BY {order_by}"
+            )
+            cur.execute(query, params)
+            return _rows_as_dicts(cur)
+        except pyodbc.Error as exc:
+            raise SourceQueryError(str(exc)) from exc
+
+    def count_rows(self, schema: str, table: str) -> int:
+        try:
+            cur = self._connection().cursor()
+            cur.execute(f"SELECT COUNT(*) FROM {_quote_ident(schema)}.{_quote_ident(table)}")
+            return int(cur.fetchone()[0])
+        except pyodbc.Error as exc:
+            raise SourceQueryError(str(exc)) from exc
+
+    def iter_rows(
+        self, schema: str, table: str, columns: list[str], batch_size: int, order_by: list[str] | None = None
+    ) -> Iterator[list[dict[str, Any]]]:
+        order_columns = order_by if order_by else columns
+
+        @with_timeout(settings.STAGING_MATERIALIZATION_QUERY_TIMEOUT_SECONDS)
+        def _fetch_batch(offset: int) -> list[dict[str, Any]]:
+            try:
+                cur = self._connection().cursor()
+                col_list = ", ".join(_quote_ident(c) for c in columns)
+                order_list = ", ".join(_quote_ident(c) for c in order_columns)
+                # T-SQL requires an ORDER BY for OFFSET/FETCH NEXT — no
+                # implicit row order exists otherwise, unlike TOP (?) alone.
+                query = (
+                    f"SELECT {col_list} FROM {_quote_ident(schema)}.{_quote_ident(table)} "
+                    f"ORDER BY {order_list} OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
+                )
+                cur.execute(query, offset, batch_size)
+                return _rows_as_dicts(cur)
+            except pyodbc.Error as exc:
+                raise SourceQueryError(str(exc)) from exc
+
+        offset = 0
+        while True:
+            batch = _fetch_batch(offset)
+            if not batch:
+                return
+            yield batch
+            if len(batch) < batch_size:
+                return
+            offset += batch_size
 
     def close(self) -> None:
         if self._conn is not None:

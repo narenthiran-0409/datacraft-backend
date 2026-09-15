@@ -8,8 +8,12 @@ from app.core.database import get_db
 from app.core.dependencies import require_permission
 from app.core.exceptions import IssueNotFoundError
 from app.db.models import CorrectionSuggestion, Issue, User
+from app.modules.ai.trace_service import AITraceService
 from app.modules.review.decision_service import CorrectionDecisionService
 from app.modules.review.schemas import (
+    AITracePromptResponse,
+    AITraceResponse,
+    AITraceUsageEntryResponse,
     BulkActionRequest,
     BulkActionResponse,
     CorrectIssueRequest,
@@ -38,6 +42,10 @@ def get_suggestion_service(db: Session = Depends(get_db)) -> SuggestionService:
 
 def get_decision_service(db: Session = Depends(get_db)) -> CorrectionDecisionService:
     return CorrectionDecisionService(db)
+
+
+def get_ai_trace_service(db: Session = Depends(get_db)) -> AITraceService:
+    return AITraceService(db)
 
 
 @router.get("/reviews", response_model=list[ReviewRunResponse])
@@ -190,3 +198,32 @@ def correct_issue_directly(
     current_user: User = Depends(require_permission("review.edit")),
 ) -> CorrectionResponse:
     return CorrectionResponse.model_validate(service.correct_directly(issue_id, payload.final_value, current_user))
+
+
+@router.get("/suggestions/{suggestion_id}/ai-trace", response_model=AITraceResponse)
+def get_suggestion_ai_trace(
+    suggestion_id: uuid.UUID,
+    service: AITraceService = Depends(get_ai_trace_service),
+    _: User = Depends(require_permission("review.read")),
+) -> AITraceResponse:
+    """Phase 4.9 — read-only audit trace. Never invokes AI; never
+    returns raw prompt body, raw model response, or any credential."""
+    trace = service.get_trace(suggestion_id)
+    return AITraceResponse(
+        correction_suggestion_id=trace.correction_suggestion_id, ai_suggestion_id=trace.ai_suggestion_id,
+        is_llm_backed=trace.is_llm_backed, linkage_status=trace.linkage_status, provider=trace.provider,
+        model=trace.model,
+        prompt=(
+            AITracePromptResponse(id=trace.prompt.id, key=trace.prompt.key, version_number=trace.prompt.version_number)
+            if trace.prompt is not None
+            else None
+        ),
+        usage=[
+            AITraceUsageEntryResponse(
+                id=u.id, provider=u.provider, model=u.model, prompt_version_id=u.prompt_version_id,
+                input_tokens=u.input_tokens, output_tokens=u.output_tokens, total_tokens=u.total_tokens,
+                latency_ms=u.latency_ms, status=u.status, created_at=u.created_at,
+            )
+            for u in trace.usage
+        ],
+    )

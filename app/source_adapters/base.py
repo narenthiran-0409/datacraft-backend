@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 
 class ConnectionTestResult:
@@ -56,6 +56,13 @@ class SourceDatabaseProvider(ABC):
     per record. The other four providers remain NotImplementedError,
     consistent with this project's standing PostgreSQL-only live-
     verification policy (mock-only for SQL Server/MySQL/Oracle/SAP HANA).
+
+    Phase 4.12 adds count_rows() (an exact, bounded-timeout row count — NOT
+    the cheap catalog-statistics estimate get_row_count() already provides)
+    and iter_rows() (a bounded-memory, batched full-table read), implemented
+    for all five providers — the provider-agnostic full-read contract
+    materialized staging is built on. Neither method ever writes; both are
+    read-only, exactly like every other method on this interface.
     """
 
     @abstractmethod
@@ -142,6 +149,50 @@ class SourceDatabaseProvider(ABC):
 
     @abstractmethod
     def fetch_rows_by_keys(self, schema: str, table: str, keys: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        raise NotImplementedError("Implemented in a later phase")
+
+    @abstractmethod
+    def count_rows(self, schema: str, table: str) -> int:
+        """An EXACT row count via a live SELECT COUNT(*) — deliberately
+        distinct from get_row_count()'s cheap catalog-statistics estimate.
+        Used only by staging materialization to establish the
+        source_row_count invariant a completed materialization run must
+        match. Bounded by STAGING_MATERIALIZATION_QUERY_TIMEOUT_SECONDS."""
+        raise NotImplementedError("Implemented in a later phase")
+
+    @abstractmethod
+    def iter_rows(
+        self, schema: str, table: str, columns: list[str], batch_size: int, order_by: list[str] | None = None
+    ) -> Iterator[list[dict[str, Any]]]:
+        """Bounded-memory, batched full-table read for staging
+        materialization. Yields lists of up to batch_size row-dicts
+        (selecting exactly `columns`, in that order) until the table is
+        exhausted — never loads the whole table into memory at once (unlike
+        sample_rows(), which returns one fully-materialized SampleResult).
+        Never writes.
+
+        order_by, when given (the dataset's resolved business-key column
+        names), is used as a deterministic ORDER BY for stable pagination.
+        When None (a ROW_INDEX_FALLBACK dataset with no configured key),
+        `columns` itself is used as the ORDER BY instead, so pagination is
+        still deterministic (every row appears in exactly one batch)
+        despite there being no natural key.
+
+        Implemented via ORDER BY + OFFSET/LIMIT (or each vendor's
+        equivalent) rather than a server-side cursor — correct for a stable
+        snapshot of the source table, but callers should be aware this does
+        not guard against the source table's row count changing mid-copy
+        (a concurrent insert/delete could shift which rows later OFFSET
+        windows return). The one invariant this method's caller CAN and
+        does check is the total row count via count_rows() taken
+        immediately before iteration begins, compared against the number of
+        rows actually yielded.
+
+        Callers may abandon a partially-consumed iterator (e.g. on
+        cancellation) without further cleanup beyond the provider's own
+        close() — no server-side cursor is held open across yields, only
+        the ordinary cached connection every other method on this provider
+        already reuses."""
         raise NotImplementedError("Implemented in a later phase")
 
     @abstractmethod

@@ -8,6 +8,8 @@ from app.core.dependencies import require_permission
 from app.core.exceptions import ValidationRunNotFoundError
 from app.db.models import User
 from app.modules.validation.schemas import (
+    EvaluatedRuleListResponse,
+    EvaluatedRuleResponse,
     ValidationFailureListResponse,
     ValidationFailureResponse,
     ValidationRunCreateRequest,
@@ -86,6 +88,22 @@ def list_validation_failures(
     )
     return ValidationFailureListResponse(
         items=[ValidationFailureResponse(**item) for item in items], total=total, page=page, page_size=page_size
+    )
+
+
+@router.get("/validation-runs/{validation_run_id}/evaluated-rules", response_model=EvaluatedRuleListResponse)
+def list_evaluated_rules(
+    validation_run_id: uuid.UUID,
+    service: ValidationService = Depends(get_validation_service),
+    _: User = Depends(require_permission("metadata.read")),
+) -> EvaluatedRuleListResponse:
+    """The RuleAssignments actually resolved and evaluated for this run —
+    with real names/columns/origin — so the UI can prove
+    rules_evaluated_count corresponds to concrete rules, including ones
+    that produced zero failures (which never appear in /failures)."""
+    items = service.list_evaluated_rules(validation_run_id=validation_run_id)
+    return EvaluatedRuleListResponse(
+        items=[EvaluatedRuleResponse(**item) for item in items], total=len(items)
     )
 
 

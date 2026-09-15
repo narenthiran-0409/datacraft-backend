@@ -21,6 +21,8 @@ class ValidationRunResponse(BaseModel):
     warning_rows: int
     failed_rows: int
     quality_score: Decimal | None
+    rules_evaluated_count: int
+    no_applicable_rules: bool
     error_message: str | None
     triggered_by: uuid.UUID | None
     started_at: datetime | None
@@ -41,6 +43,7 @@ class ValidationFailureResponse(BaseModel):
     rule_id: uuid.UUID
     rule_name: str
     rule_type: str
+    rule_origin: str
     assignment_scope: str
     column_id: uuid.UUID | None
     column_name: str | None
@@ -56,3 +59,20 @@ class ValidationFailureListResponse(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class EvaluatedRuleResponse(BaseModel):
+    rule_assignment_id: uuid.UUID
+    rule_id: uuid.UUID
+    rule_name: str
+    rule_type: str
+    rule_origin: str
+    assignment_scope: str
+    column_id: uuid.UUID | None
+    column_name: str | None
+    severity: str
+
+
+class EvaluatedRuleListResponse(BaseModel):
+    items: list[EvaluatedRuleResponse]
+    total: int

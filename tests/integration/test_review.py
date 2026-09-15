@@ -418,7 +418,7 @@ def test_ai_suggestion_id_check_constraint_enforced_without_fk(db: Session, admi
 
     bad = CorrectionSuggestion(
         issue_id=issue.id, source="AI", ai_suggestion_id=None, suggested_value="x",
-        confidence=Decimal("0.5"), fix_type="fake", is_selected=False,
+        confidence=Decimal("0.5"), category="NEEDS_REVIEW", fix_type="fake", is_selected=False,
     )
     db.add(bad)
     with pytest.raises(IntegrityError):
@@ -428,7 +428,7 @@ def test_ai_suggestion_id_check_constraint_enforced_without_fk(db: Session, admi
     # A NULL ai_suggestion_id IS allowed (no FK to violate) as long as source != 'AI'.
     ok = CorrectionSuggestion(
         issue_id=issue.id, source="RULE_BASED", ai_suggestion_id=None, suggested_value="x",
-        confidence=Decimal("0.5"), fix_type="fake", is_selected=False,
+        confidence=Decimal("0.5"), category="DETERMINISTIC", fix_type="fake", is_selected=False,
     )
     db.add(ok)
     db.flush()  # should not raise

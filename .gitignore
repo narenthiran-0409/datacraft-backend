@@ -19,3 +19,5 @@ htmlcov/
 .idea/
 
 *.log
+
+data/publish_exports/

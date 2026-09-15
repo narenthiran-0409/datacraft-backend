@@ -14,6 +14,8 @@ PERMISSION_ROUTES = [
     ("POST", f"/api/v1/reviews/{RANDOM_ID}/staging", None),
     ("GET", f"/api/v1/staging-runs/{RANDOM_ID}", None),
     ("GET", f"/api/v1/staging-runs/{RANDOM_ID}/records", None),
+    ("GET", f"/api/v1/staging-runs/{RANDOM_ID}/destination", None),
+    ("GET", f"/api/v1/staging-runs/{RANDOM_ID}/preview", None),
 ]
 
 
@@ -226,6 +228,56 @@ def test_approver_can_trigger_staging(client: TestClient, approver_headers: dict
     finally:
         db.execute(text(f"DROP TABLE IF EXISTS {table_name}"))
         db.commit()
+
+
+def test_get_staging_destination_not_materialized_returns_409(client: TestClient, admin_headers: dict, staged_run) -> None:
+    _, staging_run = staged_run
+    response = client.get(f"/api/v1/staging-runs/{staging_run.id}/destination", headers=admin_headers)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "STAGING_RUN_NOT_MATERIALIZED"
+
+
+def test_get_staging_preview_not_materialized_returns_409(client: TestClient, admin_headers: dict, staged_run) -> None:
+    _, staging_run = staged_run
+    response = client.get(f"/api/v1/staging-runs/{staging_run.id}/preview", headers=admin_headers)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "STAGING_RUN_NOT_MATERIALIZED"
+
+
+def test_get_staging_destination_materialized_returns_200(client: TestClient, admin_headers: dict, db: Session, staged_run) -> None:
+    from app.modules.staging.tasks import run_staging_materialization
+
+    _, staging_run = staged_run
+    result = run_staging_materialization(str(staging_run.job_id), str(staging_run.id))
+    assert result["status"] == "READY"
+
+    response = client.get(f"/api/v1/staging-runs/{staging_run.id}/destination", headers=admin_headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["destination_schema"] == "staging_data"
+    assert body["source_row_count"] == 3
+    assert body["materialized_row_count"] == 3
+    assert {c["name"] for c in body["columns"]} == {"id", "val"}
+
+
+def test_get_staging_preview_materialized_returns_200(client: TestClient, admin_headers: dict, db: Session, staged_run) -> None:
+    from app.modules.staging.tasks import run_staging_materialization
+
+    _, staging_run = staged_run
+    result = run_staging_materialization(str(staging_run.job_id), str(staging_run.id))
+    assert result["status"] == "READY"
+
+    response = client.get(f"/api/v1/staging-runs/{staging_run.id}/preview", headers=admin_headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_rows"] == 3
+    assert len(body["rows"]) == 3
+
+    changed_response = client.get(
+        f"/api/v1/staging-runs/{staging_run.id}/preview", headers=admin_headers, params={"filter": "CHANGED"}
+    )
+    assert changed_response.status_code == 200
+    assert changed_response.json()["total_rows"] == 1
 
 
 def test_trigger_staging_no_approval_returns_409(client: TestClient, admin_headers: dict, db: Session, staged_run) -> None:

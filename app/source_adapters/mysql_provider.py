@@ -11,7 +11,7 @@ is a known MySQL limitation, not a bug.
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Iterator
 
 from app.core.config import settings
 from app.source_adapters.base import ColumnExactStats, ConnectionTestResult, ProviderCapabilities, SampleResult, SourceDatabaseProvider
@@ -312,6 +312,44 @@ class MySQLProvider(SourceDatabaseProvider):
 
     def fetch_rows_by_keys(self, schema: str, table: str, keys: list[dict[str, Any]]) -> list[dict[str, Any]]:
         raise NotImplementedError("Implemented in a later phase")
+
+    def count_rows(self, schema: str, table: str) -> int:
+        try:
+            with self._connection().cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {_quote_ident(schema)}.{_quote_ident(table)}")
+                return int(cur.fetchone()[0])
+        except pymysql.MySQLError as exc:
+            raise SourceQueryError(str(exc)) from exc
+
+    def iter_rows(
+        self, schema: str, table: str, columns: list[str], batch_size: int, order_by: list[str] | None = None
+    ) -> Iterator[list[dict[str, Any]]]:
+        order_columns = order_by if order_by else columns
+
+        @with_timeout(settings.STAGING_MATERIALIZATION_QUERY_TIMEOUT_SECONDS)
+        def _fetch_batch(offset: int) -> list[dict[str, Any]]:
+            try:
+                with self._connection().cursor() as cur:
+                    col_list = ", ".join(_quote_ident(c) for c in columns)
+                    order_list = ", ".join(_quote_ident(c) for c in order_columns)
+                    query = (
+                        f"SELECT {col_list} FROM {_quote_ident(schema)}.{_quote_ident(table)} "
+                        f"ORDER BY {order_list} LIMIT %s OFFSET %s"
+                    )
+                    cur.execute(query, (batch_size, offset))
+                    return _rows_as_dicts(cur)
+            except pymysql.MySQLError as exc:
+                raise SourceQueryError(str(exc)) from exc
+
+        offset = 0
+        while True:
+            batch = _fetch_batch(offset)
+            if not batch:
+                return
+            yield batch
+            if len(batch) < batch_size:
+                return
+            offset += batch_size
 
     def close(self) -> None:
         if self._conn is not None and self._conn.open:

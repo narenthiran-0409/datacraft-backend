@@ -29,6 +29,7 @@ class OrchestratorResult:
     input_tokens: int | None
     output_tokens: int | None
     latency_ms: int
+    usage_log_id: uuid.UUID
 
 
 class AIOrchestratorService:
@@ -85,16 +86,28 @@ class AIOrchestratorService:
                 system=system_prompt, messages=[user_message], model=resolved_model, max_tokens=max_tokens,
                 timeout_seconds=settings.AI_REQUEST_TIMEOUT_SECONDS,
             )
-        except AIProviderUnavailableError:
+        except AIProviderUnavailableError as exc:
             latency_ms = int((time.monotonic() - start) * 1000)
-            self._log_usage(
+            usage_log = self._log_usage(
                 actor=actor, provider=provider.name, model=resolved_model, prompt_version_id=prompt_version.id,
                 conversation_id=conversation_id, ai_suggestion_id=ai_suggestion_id_for_usage_log,
                 input_tokens=None, output_tokens=None, latency_ms=latency_ms, cost_estimate=None,
             )
+            # Phase 4.9: callers (e.g. AISuggestionService.generate_corrections)
+            # isolate one issue's failure with their own try/except that
+            # calls self._db.rollback() — which would otherwise silently
+            # discard this just-written usage log too, since _log_usage only
+            # flushes (see its own commit, added this phase, for why that's
+            # no longer sufficient on its own). Attaching the id onto the
+            # exception lets such a caller still backfill
+            # ai_usage_logs.ai_suggestion_id once it creates its own
+            # (possibly degraded/fallback) ai_suggestions row for this
+            # attempt — never fabricating a link, only completing one for a
+            # usage log that verifiably already exists.
+            exc.usage_log_id = usage_log.id
             raise
 
-        self._log_usage(
+        usage_log = self._log_usage(
             actor=actor, provider=provider.name, model=resolved_model, prompt_version_id=prompt_version.id,
             conversation_id=conversation_id, ai_suggestion_id=ai_suggestion_id_for_usage_log,
             input_tokens=response.input_tokens, output_tokens=response.output_tokens,
@@ -104,23 +117,34 @@ class AIOrchestratorService:
         return OrchestratorResult(
             text=response.content, provider=provider.name, model=resolved_model, prompt_version=prompt_version,
             context_hash=context_hash, input_tokens=response.input_tokens, output_tokens=response.output_tokens,
-            latency_ms=response.latency_ms,
+            latency_ms=response.latency_ms, usage_log_id=usage_log.id,
         )
 
     def _log_usage(
         self, *, actor: User, provider: str, model: str, prompt_version_id: uuid.UUID,
         conversation_id: uuid.UUID | None, ai_suggestion_id: uuid.UUID | None,
         input_tokens: int | None, output_tokens: int | None, latency_ms: int, cost_estimate: Decimal | None,
-    ) -> None:
-        self._db.add(
-            AIUsageLog(
-                conversation_id=conversation_id, ai_suggestion_id=ai_suggestion_id, user_id=actor.id,
-                provider=provider, model=model, prompt_version_id=prompt_version_id,
-                input_tokens=input_tokens, output_tokens=output_tokens, latency_ms=latency_ms,
-                cost_estimate=cost_estimate,
-            )
+    ) -> AIUsageLog:
+        usage_log = AIUsageLog(
+            conversation_id=conversation_id, ai_suggestion_id=ai_suggestion_id, user_id=actor.id,
+            provider=provider, model=model, prompt_version_id=prompt_version_id,
+            input_tokens=input_tokens, output_tokens=output_tokens, latency_ms=latency_ms,
+            cost_estimate=cost_estimate,
         )
+        self._db.add(usage_log)
         self._db.flush()
+        # Phase 4.9: committed immediately, not merely flushed — mirrors the
+        # already-established precedent in AISuggestionService._correction_context
+        # ("Committed immediately so this audit trail survives even if the
+        # subsequent LLM call fails and the per-issue handler rolls back").
+        # Usage/cost tracking is supposed to be unconditional (see this
+        # class's own docstring); without this commit, a per-issue
+        # rollback triggered by a LATER step (response parsing, evidence
+        # safety enforcement) would silently destroy the record of a real,
+        # already-executed, already-billed provider call.
+        self._db.commit()
+        self._db.refresh(usage_log)
+        return usage_log
 
 
 def _render_context(context: dict) -> str:

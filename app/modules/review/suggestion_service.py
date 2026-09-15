@@ -129,8 +129,8 @@ class SuggestionService:
                         self._db.add(
                             CorrectionSuggestion(
                                 issue_id=issue.id, source="RULE_BASED", suggested_value=draft.suggested_value,
-                                confidence=draft.confidence, fix_type=generator_cls.fix_type,
-                                reasoning=draft.reasoning, is_selected=False,
+                                confidence=draft.confidence, category="DETERMINISTIC",
+                                fix_type=generator_cls.fix_type, reasoning=draft.reasoning, is_selected=False,
                             )
                         )
                         generated_count += 1

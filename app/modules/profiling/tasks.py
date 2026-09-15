@@ -65,172 +65,212 @@ def run_profile(job_id: str, profile_run_id: str) -> dict:
         dataset = db.get(Dataset, job.entity_id)
         audit = AuditingService(db)
 
-        jobs_service.mark_running(job.id)
-        now = datetime.now(timezone.utc)
-        profile_run.status = "RUNNING"
-        profile_run.started_at = now
-        db.commit()
-        audit.record(actor=actor, action="profiling.started", entity_type="DATASET", entity_id=dataset.id)
-        db.commit()
-
-        schema_row = db.get(Schema, dataset.schema_id)
-        connection = db.get(Connection, schema_row.connection_id)
-        connection_type = db.get(ConnectionType, connection.connection_type_id)
-        vault = LocalRedisVaultClient(redis_client, settings.VAULT_LOCAL_ENCRYPTION_KEY)
-
         try:
-            credential = vault.resolve(connection.credential_ref)
-            provider = get_provider(
-                connection_type.code,
-                host=connection.host,
-                port=connection.port,
-                database=connection.database_name,
-                username=credential.get("username", connection.username),
-                password=credential.get("password", ""),
+            return _execute_profiling(
+                db, redis_client, jobs_service, audit, job, profile_run, dataset, actor, include_top_values
             )
-        except _TERMINAL_ERRORS as exc:
+        except Exception as exc:
+            # Catch-all safety net, mirroring validation's run_validation/
+            # _execute_validation split: every error this task anticipates
+            # (source connection/query/timeout errors, a provider not yet
+            # implementing exact-stats push-down, explicit cancellation) is
+            # already handled and returned from inside _execute_profiling()
+            # itself. Reaching here means something genuinely unexpected
+            # happened — without this, the job/profile_run stay stuck at
+            # RUNNING with no error recorded, dependent entirely on the
+            # generic stale-job sweep (which has no specific error_message)
+            # to ever notice, rather than failing cleanly right away.
+            db.rollback()
             message = f"{type(exc).__name__}: {exc}"
             _fail(jobs_service, audit, job, profile_run, dataset, actor, message)
             db.commit()
             clear_include_top_values(redis_client, profile_run.id)
             return {"status": "FAILED", "error": message}
+    finally:
+        db.close()
 
-        # Snapshot currently-active columns once, at task start. A column
-        # activated/deactivated mid-run by a concurrent Discovery run is a
-        # known, accepted race — not resolved by this phase.
-        active_columns = db.execute(
-            select(Column).where(Column.dataset_id == dataset.id, Column.is_active.is_(True))
-        ).scalars().all()
-        column_names = [c.name for c in active_columns]
+
+def _execute_profiling(db, redis_client, jobs_service, audit, job, profile_run, dataset, actor, include_top_values) -> dict:
+    jobs_service.mark_running(job.id)
+    now = datetime.now(timezone.utc)
+    profile_run.status = "RUNNING"
+    profile_run.started_at = now
+    db.commit()
+    audit.record(actor=actor, action="profiling.started", entity_type="DATASET", entity_id=dataset.id)
+    db.commit()
+
+    schema_row = db.get(Schema, dataset.schema_id)
+    connection = db.get(Connection, schema_row.connection_id)
+    connection_type = db.get(ConnectionType, connection.connection_type_id)
+    vault = LocalRedisVaultClient(redis_client, settings.VAULT_LOCAL_ENCRYPTION_KEY)
+
+    try:
+        credential = vault.resolve(connection.credential_ref)
+        provider = get_provider(
+            connection_type.code,
+            host=connection.host,
+            port=connection.port,
+            database=connection.database_name,
+            username=credential.get("username", connection.username),
+            password=credential.get("password", ""),
+        )
+    except _TERMINAL_ERRORS as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        _fail(jobs_service, audit, job, profile_run, dataset, actor, message)
+        db.commit()
+        clear_include_top_values(redis_client, profile_run.id)
+        return {"status": "FAILED", "error": message}
+
+    # Snapshot currently-active columns once, at task start. A column
+    # activated/deactivated mid-run by a concurrent Discovery run is a
+    # known, accepted race — not resolved by this phase.
+    active_columns = db.execute(
+        select(Column).where(Column.dataset_id == dataset.id, Column.is_active.is_(True))
+    ).scalars().all()
+    column_names = [c.name for c in active_columns]
+
+    try:
+        try:
+            exact_stats = (
+                provider.get_dataset_column_stats(schema_row.name, dataset.name, column_names)
+                if column_names
+                else {}
+            )
+        except (ExactStatsTimeoutError, NotImplementedError):
+            # Some providers (e.g. SQLServerProvider, MySQLProvider,
+            # OracleProvider, SAPHanaProvider) don't implement the exact-stats
+            # push-down yet and raise NotImplementedError unconditionally —
+            # per this project's own documented, standing policy
+            # (SourceDatabaseProvider's docstring: "PostgreSQL-only live-
+            # verification policy, mock-only for the other four providers").
+            # That is contractually the same situation as an
+            # ExactStatsTimeoutError — "no exact stats available this run" —
+            # not a fatal error. profile_column() below already has a full,
+            # provider-agnostic fallback for exact_stats=None: every required
+            # statistic (null/distinct/duplicate count+percentage, min/max,
+            # mean/median/mode/stddev/sum, outlier_count) is computed directly
+            # from the sampled rows instead. Nothing is silently skipped —
+            # pattern_summary["exact_stats"] on each resulting ColumnProfile
+            # records that this run used the sample-derived path, not the
+            # push-down one.
+            exact_stats = {}
+
+        is_full_scan_requested = profile_run.sample_size is None
+        if is_full_scan_requested:
+            sample_size_to_request = dataset.row_count_estimate or settings.PROFILING_MAX_FULL_SCAN_ROWS
+        else:
+            sample_size_to_request = profile_run.sample_size
+
+        sample_result = provider.sample_rows(
+            schema_row.name,
+            dataset.name,
+            sample_size_to_request,
+            row_count_estimate=dataset.row_count_estimate,
+        )
+    except (SourceTimeoutError, SourceQueryError) as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        _fail(jobs_service, audit, job, profile_run, dataset, actor, message)
+        db.commit()
+        clear_include_top_values(redis_client, profile_run.id)
+        return {"status": "FAILED", "error": message}
+    finally:
+        provider.close()
+
+    rows = sample_result.rows
+    column_success_count = 0
+    column_failure_count = 0
+    cancelled = False
+
+    for column in active_columns:
+        if jobs_service.is_cancel_requested(job.id):
+            cancelled = True
+            break
 
         try:
-            try:
-                exact_stats = (
-                    provider.get_dataset_column_stats(schema_row.name, dataset.name, column_names)
-                    if column_names
-                    else {}
-                )
-            except ExactStatsTimeoutError:
-                exact_stats = {}
-
-            is_full_scan_requested = profile_run.sample_size is None
-            if is_full_scan_requested:
-                sample_size_to_request = dataset.row_count_estimate or settings.PROFILING_MAX_FULL_SCAN_ROWS
-            else:
-                sample_size_to_request = profile_run.sample_size
-
-            sample_result = provider.sample_rows(
-                schema_row.name,
-                dataset.name,
-                sample_size_to_request,
-                row_count_estimate=dataset.row_count_estimate,
+            sample_values = [row.get(column.name) for row in rows]
+            profile_fields = profile_column(
+                column_name=column.name,
+                normalized_data_type=column.normalized_data_type,
+                sample_values=sample_values,
+                exact_stats=exact_stats.get(column.name),
+                include_top_values=include_top_values,
             )
-        except (SourceTimeoutError, SourceQueryError) as exc:
-            message = f"{type(exc).__name__}: {exc}"
-            _fail(jobs_service, audit, job, profile_run, dataset, actor, message)
+            db.add(ColumnProfile(profile_run_id=profile_run.id, column_id=column.id, **profile_fields))
             db.commit()
-            clear_include_top_values(redis_client, profile_run.id)
-            return {"status": "FAILED", "error": message}
-        finally:
-            provider.close()
-
-        rows = sample_result.rows
-        column_success_count = 0
-        column_failure_count = 0
-        cancelled = False
-
-        for column in active_columns:
-            if jobs_service.is_cancel_requested(job.id):
-                cancelled = True
-                break
-
-            try:
-                sample_values = [row.get(column.name) for row in rows]
-                profile_fields = profile_column(
-                    column_name=column.name,
-                    normalized_data_type=column.normalized_data_type,
-                    sample_values=sample_values,
-                    exact_stats=exact_stats.get(column.name),
-                    include_top_values=include_top_values,
-                )
-                db.add(ColumnProfile(profile_run_id=profile_run.id, column_id=column.id, **profile_fields))
-                db.commit()
-                column_success_count += 1
-            except Exception as exc:  # noqa: BLE001
-                db.rollback()
-                column_failure_count += 1
-                audit.record(
-                    actor=actor,
-                    action="profiling.column_failed",
-                    entity_type="DATASET",
-                    entity_id=dataset.id,
-                    metadata={"column": column.name, "error": str(exc)},
-                )
-                db.commit()
-                continue
-
-        if cancelled:
-            jobs_service.mark_cancelled(job.id)
-            jobs_service.clear_cancel_flag(job.id)
-            now = datetime.now(timezone.utc)
-            profile_run.status = "CANCELLED"
-            profile_run.completed_at = now
+            column_success_count += 1
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            column_failure_count += 1
             audit.record(
                 actor=actor,
-                action="profiling.cancelled",
+                action="profiling.column_failed",
                 entity_type="DATASET",
                 entity_id=dataset.id,
-                metadata={"columns_profiled": column_success_count},
+                metadata={"column": column.name, "error": str(exc)},
             )
             db.commit()
-            clear_include_top_values(redis_client, profile_run.id)
-            return {"status": "CANCELLED"}
+            continue
 
-        duplicate_percentage = compute_dataset_duplicate_percentage(rows)
-
-        profile_run.sample_size = len(rows)
-        if sample_result.is_full_scan:
-            profile_run.row_count = len(rows)
-        else:
-            db.refresh(dataset)
-            profile_run.row_count = dataset.row_count_estimate
-        profile_run.duplicate_percentage = duplicate_percentage
-        # profile_run.null_percentage and profile_run.quality_score are
-        # NEVER set — both remain NULL, reserved for a later phase.
-
-        summary_message = None
-        if column_failure_count > 0:
-            summary_message = (
-                f"{column_success_count}/{len(active_columns)} columns profiled, {column_failure_count} failed"
-            )
-
+    if cancelled:
+        jobs_service.mark_cancelled(job.id)
+        jobs_service.clear_cancel_flag(job.id)
         now = datetime.now(timezone.utc)
-        profile_run.status = "COMPLETED"
+        profile_run.status = "CANCELLED"
         profile_run.completed_at = now
-        profile_run.error_message = summary_message
-        jobs_service.mark_completed(job.id, error_message=summary_message)
-
         audit.record(
             actor=actor,
-            action="profiling.completed",
+            action="profiling.cancelled",
             entity_type="DATASET",
             entity_id=dataset.id,
-            metadata={
-                "columns_profiled": column_success_count,
-                "columns_failed": column_failure_count,
-                "sample_size": profile_run.sample_size,
-                "is_full_scan": sample_result.is_full_scan,
-            },
+            metadata={"columns_profiled": column_success_count},
         )
         db.commit()
         clear_include_top_values(redis_client, profile_run.id)
-        return {
-            "status": "COMPLETED",
+        return {"status": "CANCELLED"}
+
+    duplicate_percentage = compute_dataset_duplicate_percentage(rows)
+
+    profile_run.sample_size = len(rows)
+    if sample_result.is_full_scan:
+        profile_run.row_count = len(rows)
+    else:
+        db.refresh(dataset)
+        profile_run.row_count = dataset.row_count_estimate
+    profile_run.duplicate_percentage = duplicate_percentage
+    # profile_run.null_percentage and profile_run.quality_score are
+    # NEVER set — both remain NULL, reserved for a later phase.
+
+    summary_message = None
+    if column_failure_count > 0:
+        summary_message = (
+            f"{column_success_count}/{len(active_columns)} columns profiled, {column_failure_count} failed"
+        )
+
+    now = datetime.now(timezone.utc)
+    profile_run.status = "COMPLETED"
+    profile_run.completed_at = now
+    profile_run.error_message = summary_message
+    jobs_service.mark_completed(job.id, error_message=summary_message)
+
+    audit.record(
+        actor=actor,
+        action="profiling.completed",
+        entity_type="DATASET",
+        entity_id=dataset.id,
+        metadata={
             "columns_profiled": column_success_count,
             "columns_failed": column_failure_count,
-        }
-    finally:
-        db.close()
+            "sample_size": profile_run.sample_size,
+            "is_full_scan": sample_result.is_full_scan,
+        },
+    )
+    db.commit()
+    clear_include_top_values(redis_client, profile_run.id)
+    return {
+        "status": "COMPLETED",
+        "columns_profiled": column_success_count,
+        "columns_failed": column_failure_count,
+    }
 
 
 def _fail(jobs_service, audit, job, profile_run, dataset, actor, message: str) -> None:
